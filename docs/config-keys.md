@@ -18,6 +18,7 @@ The file declares `schema: 1`, the only version this build reads. A duration is 
 | `verifiers.<name>.run` | command | required | what `done` runs through `sh`; required in a declared verifier |
 | `verifiers.<name>.timeout` | duration | `10m` | how long `done` lets the command run |
 | `verifiers.<name>.default` | boolean | `false` | `true` writes the verifier into every task `ank new task` creates |
+| `verifier_jobs` | integer | none | how many verifiers one `done` runs at once, at least 1; absent, the machine's available parallelism |
 | `roles.<name>.can` | list of strings | `[]` | what the role may do, declared |
 | `roles.<name>.cannot` | list of strings | `[]` | what the role may not do, declared |
 | `identities.<identity>` | string | none | the role of an identity; one absent from the table is an `agent` |

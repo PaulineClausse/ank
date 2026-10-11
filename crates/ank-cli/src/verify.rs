@@ -143,6 +143,22 @@ fn on_path(name: &str) -> Option<PathBuf> {
 /// that is waiting for it to exit, and a test suite is exactly the kind of
 /// command that prints a lot.
 pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
+    Ok(run_until(cwd, name, v, &|| false)?.expect("a run nothing stops is never cancelled"))
+}
+
+/// [`run`], polling `stop` while the verifier runs: once it answers true the
+/// verifier is killed and `None` comes back, an outcome nobody will read.
+///
+/// This is what lets `done` run verifiers side by side (TASK-26eab418555a):
+/// once one fails, the ones declared after it can no longer change the
+/// answer, and letting them run on would leave them running after `done`
+/// has already said no.
+pub fn run_until(
+    cwd: &Path,
+    name: &str,
+    v: &Verifier,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<Outcome>> {
     let sh = find_sh()?;
     let out_path = std::env::temp_dir().join(format!(
         "ank-verify-{}-{}.out",
@@ -163,7 +179,13 @@ pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
     })?;
 
     let started = Instant::now();
-    let mut child = Command::new(&sh)
+    let mut command = Command::new(&sh);
+    // A group of its own, so that killing the verifier kills what it started:
+    // `sh -c "a; b"` keeps the shell as a parent, and a kill aimed at the
+    // shell alone leaves `b` running with nobody waiting for it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command
         .current_dir(cwd)
         .arg("-c")
         .arg(&v.run)
@@ -184,9 +206,13 @@ pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if stop() {
+                    kill_tree(&mut child);
+                    let _ = std::fs::remove_file(&out_path);
+                    return Ok(None);
+                }
                 if started.elapsed() >= v.timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     timed_out = true;
                     break std::process::ExitStatus::default();
                 }
@@ -223,14 +249,42 @@ pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
 
     let mut h = Sha256::new();
     h.update(&output);
-    Ok(Outcome {
+    Ok(Some(Outcome {
         name: name.to_string(),
         ok: !timed_out && status.success(),
         code,
         elapsed,
         output_hash: hex::encode(h.finalize()),
         timed_out,
-    })
+    }))
+}
+
+/// Kills a verifier and everything it started, then reaps it.
+///
+/// On Unix the verifier leads a process group of its own and the group is
+/// killed whole. On Windows `taskkill /T` walks the tree from the shell down.
+/// Both through a process rather than a binding: no crate enters for one
+/// signal, and the shell's own kill is the fallback when neither runs.
+fn kill_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The code 5 a failed verifier deserves, with the elapsed time when it ran out

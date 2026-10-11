@@ -274,6 +274,7 @@ fn every_config_key_is_printed_with_its_type_and_default() {
             ("`verifiers.<name>.run`", "command", "required"),
             ("`verifiers.<name>.timeout`", "duration", "`10m`"),
             ("`verifiers.<name>.default`", "boolean", "`false`"),
+            ("`verifier_jobs`", "integer", "none"),
             ("`roles.<name>.can`", "list of strings", "`[]`"),
             ("`roles.<name>.cannot`", "list of strings", "`[]`"),
             ("`identities.<identity>`", "string", "none"),
