@@ -13843,7 +13843,10 @@ const GLOB_FLAGS: [(&str, &str); 3] = [
 /// path if it is called `--scope`" — is exactly what would let the next
 /// `--under <glob>` through in silence, which is the failure this whole task is
 /// a correction of.
-const NOT_A_PATH: [&str; 38] = [
+const NOT_A_PATH: [&str; 39] = [
+    // Carries no value at all: `accept --pr` names nothing, it carries the
+    // ratifications to a pull request (ADR-2a63c0c87691).
+    "--pr",
     // Carries no value at all: the directory it writes is made under the
     // temporary directory by the verb, and nothing about it comes off the
     // command line (ADR-e1d750884b82).

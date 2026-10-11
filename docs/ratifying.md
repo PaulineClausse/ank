@@ -14,9 +14,31 @@ feature branch would bind on that branch alone, which is a constraint of variabl
 geometry and a ratification hash that depends on where it is read.
 
 That rule is about where you stand when you sign. It is not a licence to push to
-`main`. `accept` writes a commit and stops; it never pushes. So the ratification
-commit reaches `main` through a pull request like every other change, and CI sees
-it before it lands:
+`main`. The ratification commit reaches `main` through a pull request like every
+other change, and CI sees it before it lands. `ank accept --pr` carries it there
+(ADR-2a63c0c87691):
+
+    git switch main && git pull
+    ank accept <id>... --pr          # one commit per id, then the pull request
+    gh pr merge ratify/<id> --merge  # printed by accept, never run by it
+    git switch main && git pull
+
+`accept` takes one or more ids, and each still gets its own commit whose subject
+is `ratify <id>`: that subject is the anchor. With `--pr` it then creates
+`ratify/<first id>` at the last ratification, puts the local `main` back at its
+upstream, pushes the branch, opens the pull request with `gh`, and prints the
+merge command. **It never merges.** The merge commit, and the look at the
+ratification before it, stay yours.
+
+Before the first commit, `--pr` checks what it is about to need, and refuses with
+nothing written when any of it is missing: an upstream for `main` (exit 9), `main`
+level with that upstream and no tracked file outside `.ank/` modified (exit 7),
+and `gh` on `PATH` and authenticated (exit 9, `gh auth login`). A failure after
+the commits -- a push the remote refuses, `gh pr create` failing -- leaves them on
+`ratify/<id>` and names the command that finishes the job.
+
+Without `--pr`, `accept` writes the commits and stops; it pushes nothing. This is
+the recipe `--pr` runs, step by step, for a repository without `gh`:
 
     git switch main && git pull
     ank accept <id>                  # the gate is satisfied here

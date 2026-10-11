@@ -5451,9 +5451,12 @@ pub fn accept(
     identity: &str,
     out: &mut dyn Write,
 ) -> Result<ExitCode> {
-    let prefix = inv.positionals.first().ok_or_else(|| {
-        CliError::new(ExitCode::Generic, "accept expects an id").with_hint("ank accept <id>")
-    })?;
+    if inv.positionals.is_empty() {
+        return Err(CliError::new(ExitCode::Generic, "accept expects an id")
+            .with_hint("ank accept <id>..."));
+    }
+    let asked = inv.positionals.join(" ");
+    let pr = inv.has("--pr");
 
     // 9 and 7 are deliberately distinct. 9 says "I do not know where the right
     // place is", and the repository needs repairing; 7 says "you are not in the
@@ -5472,12 +5475,177 @@ pub fn accept(
                 "accept requires the default branch (current: {here}, default: {default_branch})"
             ),
         )
-        .with_hint(format!(
-            "git switch {default_branch} && ank accept {prefix}"
-        )));
+        .with_hint(format!("git switch {default_branch} && ank accept {asked}")));
     }
 
+    // **Every id is prepared before any is committed** (ADR-2a63c0c87691). A
+    // refusal on the third id after the first two were signed would leave the
+    // caller holding half of what they asked for, with no verb to finish it:
+    // the two signed ones now refuse a second `accept`. Preparing reads and
+    // writes nothing, so the whole list is judged first.
     let store = Store::new(&repo.ank);
+    let mut prepared: Vec<Ratification> = Vec::new();
+    for prefix in &inv.positionals {
+        let r = prepare_ratification(&store, repo, prefix, identity)?;
+        // Two prefixes naming one document are one ratification, not a
+        // second one refused for being already ratified by the first.
+        if !prepared.iter().any(|p| p.id == r.id) {
+            prepared.push(r);
+        }
+    }
+
+    // And the `--pr` prerequisites, on the same side of the first commit and
+    // for the same reason: after it there is something to undo.
+    let carry = if pr {
+        Some(pr_prerequisites(repo, &default_branch, &prepared[0].id)?)
+    } else {
+        None
+    };
+
+    // One commit per id, in the order named. The subject `ratify <id>` is the
+    // anchor, so two ratifications never share a commit.
+    let mut done: Vec<(String, Vec<(PathBuf, Option<Vec<u8>>)>)> = Vec::new();
+    for r in &prepared {
+        // **The commit is the act, so a commit that does not happen leaves
+        // nothing behind** (TASK-1dbb6e7843f1). Measured on this corpus: a
+        // signing key nothing could decrypt made `git commit` fail after the
+        // entity had been written, and it came out `accepted` carrying the
+        // anchor of a ratification that does not exist. `check` reports that as
+        // a signal, generously, and `accept` will not repair it — an existing
+        // anchor is the one thing this verb refuses to overwrite, because
+        // overwriting one is how a constraint edited in place would be
+        // re-anchored (ADR-6b3f19e08a24). So the corpus was left claiming a
+        // binding decision anchored to nothing, with `ank edit` the only route
+        // out and no message naming it.
+        //
+        // Written and then rolled back rather than committed before writing,
+        // because the commit is *of* these files: git takes what is on disk, and
+        // there is no order in which the write comes second. What the rollback
+        // owes is stated in the criterion — byte for byte, `version` included,
+        // so a failed `accept` leaves nothing for the next attempt's
+        // compare-and-swap to trip over.
+        let before = snapshot(repo, &r.paths);
+        match write_and_commit(
+            &store,
+            repo,
+            &r.replaced,
+            &r.entity,
+            r.base_version,
+            &r.paths,
+            &r.message,
+        ) {
+            Ok(commit) => done.push((commit, before)),
+            Err(e) => {
+                undo(repo, &before, &r.paths);
+                return Err(e);
+            }
+        }
+    }
+
+    let carried = match &carry {
+        Some(c) => Some(carry_to_pull_request(repo, c, &prepared, &done)?),
+        None => None,
+    };
+
+    let several = prepared.len() > 1 || pr;
+    if inv.json() {
+        let row = |r: &Ratification, commit: &str, top: bool| {
+            let superseded = r.replaced.target().map(|t| t.id().to_string());
+            let o = if top { Obj::document() } else { Obj::new() };
+            // The id under a fixed key, and the kind beside it as a value
+            // (TASK-155e98c184ed). It used to be keyed *by* the kind — `adr`
+            // over an ADR, `spec` over a spec — which was the one key in this
+            // binary whose name depended on the data. No typed client can bind
+            // that: the parser has to know the answer before it reads it.
+            o.str("id", &r.id.to_string())
+                .str("kind", r.id.kind().as_str())
+                .str("status", "accepted")
+                .opt_str("superseded", superseded.as_deref())
+                .str("commit", commit)
+                .str("anchor", &r.anchor)
+        };
+        let doc = if several {
+            Obj::document()
+                .array(
+                    "accepted",
+                    prepared
+                        .iter()
+                        .zip(&done)
+                        .map(|(r, (commit, _))| row(r, commit, false).finish()),
+                )
+                .opt_str("branch", carried.as_ref().map(|c| c.branch.as_str()))
+                .opt_str("merge", carried.as_ref().map(|c| c.merge.as_str()))
+                .finish()
+        } else {
+            row(&prepared[0], &done[0].0, true).finish()
+        };
+        let _ = writeln!(out, "{doc}");
+    } else if !inv.quiet() {
+        let style = inv.style();
+        for (r, (commit, _)) in prepared.iter().zip(&done) {
+            // Two words for two acts. Reporting "accepted" over an ADR that was
+            // already accepted would describe the wrong half of what just
+            // happened: what the caller obtained is the anchor.
+            let verb = if r.ratifying_in_place {
+                "ratified"
+            } else {
+                "accepted"
+            };
+            let _ = writeln!(
+                out,
+                "{} {} -> {}",
+                style.advanced(verb),
+                style.id(&r.id.to_string()),
+                &commit[..commit.len().min(7)]
+            );
+            if let Succession::Pending(t) = &r.replaced {
+                let _ = writeln!(
+                    out,
+                    "{} {}",
+                    style.retracted("superseded"),
+                    style.id(&t.id().to_string())
+                );
+            }
+        }
+        if let Some(c) = &carried {
+            let _ = writeln!(
+                out,
+                "pushed {} to {}, pull request opened against {default_branch}; \
+                 {default_branch} is back at its upstream",
+                c.branch, c.remote
+            );
+            // Printed and never run: the merge commit, and the review before
+            // it, stay a human's (ADR-2a63c0c87691).
+            let _ = writeln!(out, "merge it with a merge commit: {}", c.merge);
+        }
+    } else if let Some(c) = &carried {
+        // `--quiet` silences the report, not the one thing left to do.
+        let _ = writeln!(out, "{}", c.merge);
+    }
+    Ok(ExitCode::Ok)
+}
+
+/// One ratification `accept` has judged and not yet written: everything that
+/// can refuse has refused by the time one of these exists.
+struct Ratification {
+    id: EntityId,
+    entity: Entity,
+    base_version: u64,
+    replaced: Succession,
+    paths: Vec<String>,
+    message: String,
+    anchor: String,
+    ratifying_in_place: bool,
+}
+
+/// Judges one id for `accept`: resolves it, refuses on its state, and names
+/// what its commit will carry. Writes nothing.
+fn prepare_ratification(
+    store: &Store,
+    repo: &Repo,
+    prefix: &str,
+    identity: &str,
+) -> Result<Ratification> {
     let loaded = store.load_prefix(prefix)?;
     let base_version = version_of(&loaded.entity);
     let mut entity = loaded.entity;
@@ -5533,7 +5701,7 @@ pub fn accept(
     // Everything that can refuse, refused before anything is written. A
     // half-performed succession is a corpus the ratification commit would then
     // make authoritative, and `accept` has no second pass to repair it.
-    let replaced = succession(&store, &entity)?;
+    let replaced = succession(store, &entity)?;
 
     // And the last of them, on the workspace rather than on the corpus
     // (ADR-3b6ba766a42e). It sits here for the reason the comment above states:
@@ -5553,7 +5721,7 @@ pub fn accept(
     promote(&mut entity, anchor.clone(), identity);
 
     // Every path this ratification will touch, named before any of them is
-    // written, so the snapshot below is of the corpus as `accept` found it.
+    // written, so the snapshot is of the corpus as `accept` found it.
     let mut paths = Vec::new();
     if let Succession::Pending(target) = &replaced {
         paths.extend(entity_rel_paths_to_stage(repo, target.id()));
@@ -5561,103 +5729,312 @@ pub fn accept(
     paths.extend(entity_rel_paths_to_stage(repo, &id));
 
     let replaces = match replaced.target() {
-        Some(t) => format!(
-            "supersedes: {}
-",
-            t.id()
-        ),
+        Some(t) => format!("supersedes: {}\n", t.id()),
         None => String::new(),
     };
-    let message = format!(
-        "ratify {id}
+    let message = format!("ratify {id}\n\n{anchor_key}: {anchor}\n{replaces}by: {identity}\n");
 
-{anchor_key}: {anchor}
-{replaces}by: {identity}
-"
-    );
-
-    // **The commit is the act, so a commit that does not happen leaves nothing
-    // behind** (TASK-1dbb6e7843f1). Measured on this corpus: a signing key
-    // nothing could decrypt made `git commit` fail after the entity had been
-    // written, and it came out `accepted` carrying the anchor of a ratification
-    // that does not exist. `check` reports that as a signal, generously, and
-    // `accept` will not repair it — an existing anchor is the one thing this
-    // verb refuses to overwrite, because overwriting one is how a constraint
-    // edited in place would be re-anchored (ADR-6b3f19e08a24). So the corpus was
-    // left claiming a binding decision anchored to nothing, with `ank edit` the
-    // only route out and no message naming it.
-    //
-    // Written and then rolled back rather than committed before writing, because
-    // the commit is *of* these files: git takes what is on disk, and there is no
-    // order in which the write comes second. What the rollback owes is stated in
-    // the criterion — byte for byte, `version` included, so a failed `accept`
-    // leaves nothing for the next attempt's compare-and-swap to trip over.
-    //
-    // The same argument ADR-af53d0b62a5c makes for a write whose only product is
-    // a ref, and the same one the refusal above rests on.
-    let before = snapshot(repo, &paths);
-    let commit = match write_and_commit(
-        &store,
-        repo,
-        &replaced,
-        &entity,
+    Ok(Ratification {
+        id,
+        entity,
         base_version,
-        &paths,
-        &message,
-    ) {
-        Ok(commit) => commit,
-        Err(e) => {
-            undo(repo, &before, &paths);
-            return Err(e);
-        }
-    };
+        replaced,
+        paths,
+        message,
+        anchor,
+        ratifying_in_place,
+    })
+}
 
-    if inv.json() {
-        let superseded = replaced.target().map(|t| t.id().to_string());
-        // The id under a fixed key, and the kind beside it as a value
-        // (TASK-155e98c184ed). It used to be keyed *by* the kind — `adr` over an
-        // ADR, `spec` over a spec — which was the one key in this binary whose
-        // name depended on the data. No typed client can bind that: the parser
-        // has to know the answer before it reads it, and a struct cannot have a
-        // field whose name arrives at runtime. Nothing is lost by moving it,
-        // because the kind is still there and is now a value a client can match
-        // on rather than a key it has to search for.
-        let doc = Obj::document()
-            .str("id", &id.to_string())
-            .str("kind", id.kind().as_str())
-            .str("status", "accepted")
-            .opt_str("superseded", superseded.as_deref())
-            .str("commit", &commit)
-            .str("anchor", &anchor)
-            .finish();
-        let _ = writeln!(out, "{doc}");
-    } else if !inv.quiet() {
-        // Two words for two acts. Reporting "accepted" over an ADR that was
-        // already accepted would describe the wrong half of what just happened:
-        // what the caller obtained is the anchor.
-        let verb = if ratifying_in_place {
-            "ratified"
-        } else {
-            "accepted"
-        };
-        let style = inv.style();
-        let _ = writeln!(
-            out,
-            "{} {} -> {}",
-            style.advanced(verb),
-            style.id(&id.to_string()),
-            &commit[..commit.len().min(7)]
-        );
-        if let Succession::Pending(t) = &replaced {
-            let _ = writeln!(
-                out,
-                "{} {}",
-                style.retracted("superseded"),
-                style.id(&t.id().to_string())
-            );
-        }
+/// What `accept --pr` found true before its first commit, and needs after it.
+struct Carry {
+    default_branch: String,
+    /// The remote the default branch tracks, where the branch is pushed.
+    remote: String,
+    /// The commit the default branch's upstream names, and that the default
+    /// branch is level with: where it is put back after the commits.
+    upstream: String,
+    branch: String,
+}
+
+/// The `--pr` prerequisites, every one checked before the first commit
+/// (ADR-2a63c0c87691), cheapest and most local first.
+///
+/// **Level with the upstream is a prerequisite of the reset, not an extra
+/// rule.** The reset is `update-ref` and not `reset --hard`: porcelain is
+/// excluded (ADR-9307e5d214a7), and moving a branch ref leaves the work tree
+/// where it is. That is exact only when the tree was already the upstream's
+/// before the commits, which is what being level says; a default branch ahead
+/// of its upstream would carry its own commits into the pull request, and one
+/// behind would be reset under a tree that does not match it.
+fn pr_prerequisites(repo: &Repo, default_branch: &str, first: &EntityId) -> Result<Carry> {
+    let cwd = &repo.corpus;
+    let no_upstream = || {
+        CliError::new(
+            ExitCode::Environment,
+            format!(
+                "accept --pr found no upstream for {default_branch}, to reset it to and to push beside"
+            ),
+        )
+        .with_hint(format!(
+            "git branch --set-upstream-to=origin/{default_branch} {default_branch}"
+        ))
+    };
+    let remote = git::output(
+        cwd,
+        &[
+            "config",
+            "--get",
+            &format!("branch.{default_branch}.remote"),
+        ],
+    )?;
+    let remote = String::from_utf8_lossy(&remote.stdout).trim().to_string();
+    let upstream = git::output(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("{default_branch}@{{upstream}}^{{commit}}"),
+        ],
+    )?;
+    if remote.is_empty() || remote == "." || !upstream.status.success() {
+        return Err(no_upstream());
     }
-    Ok(ExitCode::Ok)
+    let upstream = String::from_utf8_lossy(&upstream.stdout).trim().to_string();
+
+    let head = git::run(cwd, &["rev-parse", "HEAD"])?;
+    if head != upstream {
+        let behind = git::is_ancestor(cwd, &head, &upstream)?;
+        return Err(CliError::new(
+            ExitCode::Prerequisite,
+            format!(
+                "accept --pr needs {default_branch} level with its upstream, and it is {}",
+                if behind {
+                    "behind"
+                } else {
+                    "ahead of it or diverged"
+                }
+            ),
+        )
+        .with_hint(if behind {
+            "git pull --ff-only".to_string()
+        } else {
+            format!("git log --oneline {default_branch}@{{upstream}}..{default_branch}")
+        }));
+    }
+
+    let changed = changed_outside_corpus(repo)?;
+    if !changed.is_empty() {
+        let mut message = format!(
+            "accept --pr resets {default_branch} after the commits, and {} tracked {} outside .ank/ {} from HEAD",
+            changed.len(),
+            if changed.len() == 1 { "file" } else { "files" },
+            if changed.len() == 1 { "differs" } else { "differ" },
+        );
+        for path in &changed {
+            message.push_str(&format!("\n  {path}"));
+        }
+        return Err(CliError::new(ExitCode::Prerequisite, message)
+            .with_hint("commit or stash them first: git status --short"));
+    }
+
+    let branch = format!("ratify/{first}");
+    let exists = git::output(
+        cwd,
+        &[
+            "rev-parse",
+            "--verify",
+            "-q",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    if exists.status.success() {
+        return Err(CliError::new(
+            ExitCode::Prerequisite,
+            format!("accept --pr creates {branch}, and it already exists"),
+        )
+        .with_hint(format!(
+            "git branch -D {branch}, once what it holds has landed"
+        )));
+    }
+
+    match gh(cwd, &["auth", "status"]) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(CliError::new(
+                ExitCode::Environment,
+                "accept --pr opens the pull request through gh, and gh is not on PATH",
+            )
+            .with_hint("https://cli.github.com"));
+        }
+        Err(e) => {
+            return Err(CliError::new(
+                ExitCode::Environment,
+                format!("gh auth status: {e}"),
+            ));
+        }
+        Ok(o) if !o.status.success() => {
+            return Err(CliError::new(
+                ExitCode::Environment,
+                "accept --pr opens the pull request through gh, and gh is not authenticated",
+            )
+            .with_hint("gh auth login"));
+        }
+        Ok(_) => {}
+    }
+
+    Ok(Carry {
+        default_branch: default_branch.to_string(),
+        remote,
+        upstream,
+        branch,
+    })
+}
+
+/// The tracked files outside the corpus directory whose working copy differs
+/// from HEAD.
+fn changed_outside_corpus(repo: &Repo) -> Result<Vec<String>> {
+    let corpus_dir = repo
+        .ank
+        .strip_prefix(&repo.corpus)
+        .map(|p| format!("{}/", p.to_string_lossy().replace('\\', "/")))
+        .unwrap_or_else(|_| ".ank/".to_string());
+    let files: Vec<String> = git::worktree_files(&repo.corpus)
+        .map(|f| f.counted)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| !p.starts_with(&corpus_dir))
+        .collect();
+    git::differing_from_head(&repo.corpus, &files)
+}
+
+/// `gh`, run in `cwd`. Not git, so not through the plumbing door: the only
+/// thing read back is the exit code.
+fn gh(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    std::process::Command::new("gh")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+}
+
+/// What `accept --pr` left on the remote.
+struct Carried {
+    branch: String,
+    remote: String,
+    merge: String,
+}
+
+/// Carries the commits `accept` has just made to a pull request, and never
+/// merges it (ADR-2a63c0c87691).
+///
+/// The branch first, and the order is the argument the manual recipe makes:
+/// once a ref holds the ratifications, putting the default branch back is a
+/// move and never a loss. Every failure after that point leaves them on the
+/// branch and names the command that finishes the job.
+fn carry_to_pull_request(
+    repo: &Repo,
+    carry: &Carry,
+    prepared: &[Ratification],
+    done: &[(String, Vec<(PathBuf, Option<Vec<u8>>)>)],
+) -> Result<Carried> {
+    let cwd = &repo.corpus;
+    let Carry {
+        default_branch,
+        remote,
+        upstream,
+        branch,
+    } = carry;
+    let last = &done.last().expect("accept commits at least once").0;
+    let push = format!("git push -u {remote} {branch}");
+    let open = format!("gh pr create --fill --base {default_branch} --head {branch}");
+    let merge = format!("gh pr merge {branch} --merge");
+
+    // An empty old value: the branch must not exist, which the prerequisites
+    // already established, and the swap says so rather than overwriting one
+    // created in between.
+    git::run(
+        cwd,
+        &["update-ref", &format!("refs/heads/{branch}"), last, ""],
+    )?;
+
+    // The default branch back to its upstream, on the commit it held before
+    // the ratifications and no other. `update-ref` moves the ref and leaves the
+    // index and the tree holding the ratified entities, so they are put back
+    // from the snapshots each commit was taken over, latest first, so that a
+    // path two ratifications wrote ends as the first one found it.
+    git::run(
+        cwd,
+        &[
+            "update-ref",
+            &format!("refs/heads/{default_branch}"),
+            upstream,
+            last,
+        ],
+    )
+    .map_err(|e| {
+        CliError::new(
+            ExitCode::Environment,
+            format!(
+                "the ratifications are on {branch}, and {default_branch} could not be reset to its upstream: {}",
+                e.message
+            ),
+        )
+        .with_hint(format!(
+            "git reset --hard {upstream} && {push} && {open}"
+        ))
+    })?;
+    for (r, (_, before)) in prepared.iter().zip(done).rev() {
+        undo(repo, before, &r.paths);
+    }
+
+    let out = git::output(
+        cwd,
+        &[
+            "push",
+            "--set-upstream",
+            remote,
+            &format!("refs/heads/{branch}:refs/heads/{branch}"),
+        ],
+    )?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(CliError::new(
+            ExitCode::Environment,
+            format!("the ratifications are on {branch}, and {remote} refused the push: {stderr}"),
+        )
+        .with_hint(format!("{push} && {open}")));
+    }
+
+    let created = gh(
+        cwd,
+        &[
+            "pr",
+            "create",
+            "--fill",
+            "--base",
+            default_branch,
+            "--head",
+            branch,
+        ],
+    );
+    let failure = match created {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(why) = failure {
+        return Err(CliError::new(
+            ExitCode::Environment,
+            format!("{branch} is on {remote}, and gh pr create failed: {why}"),
+        )
+        .with_hint(open));
+    }
+
+    Ok(Carried {
+        branch: branch.clone(),
+        remote: remote.clone(),
+        merge,
+    })
 }
 
 /// The refusal that keeps a supersession from landing while the workspace still
@@ -9713,9 +10090,14 @@ mod tests {
                 "accept must carry no bypass: {n}"
             );
         }
-        assert!(
-            spec.flags.is_empty(),
-            "accept takes no flag at all: {:?}",
+        // One flag and no other, and it bypasses nothing: `--pr` adds refusals
+        // before the commit and acts only after it (ADR-2a63c0c87691). A second
+        // flag is a change to that decision, not to this list.
+        let names: Vec<&str> = spec.flags.iter().map(|f| f.name).collect();
+        assert_eq!(
+            names,
+            ["--pr"],
+            "accept takes --pr and no other flag: {:?}",
             spec.flags
         );
     }
