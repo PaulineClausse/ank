@@ -118,6 +118,12 @@ pub static KEYS: &[ConfigKey] = &[
         "`true` writes the verifier into every task `ank new task` creates",
     ),
     key(
+        "verifier_jobs",
+        "integer",
+        Absent::None,
+        "how many verifiers one `done` runs at once, at least 1; absent, the machine's available parallelism",
+    ),
+    key(
         "roles.<name>.can",
         "list of strings",
         Absent::Text("[]"),

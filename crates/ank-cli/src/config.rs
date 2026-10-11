@@ -79,6 +79,11 @@ struct ConfigFile {
     identities: BTreeMap<String, String>,
     #[serde(default)]
     weight: Weight,
+    /// How many verifiers of one `done` run at once. Absent, the machine's
+    /// available parallelism: the bound exists for several agents sharing one
+    /// machine, and only somebody who knows there are several can set it.
+    #[serde(default)]
+    verifier_jobs: Option<usize>,
 }
 
 /// `weight:`, what the corpus declares it may grow to before `check` says so
@@ -195,9 +200,23 @@ pub struct Config {
     pub roles: BTreeMap<String, Role>,
     pub identities: BTreeMap<String, String>,
     pub weight: Weight,
+    /// The most verifiers one `done` runs at once, never zero. `None` is the
+    /// key absent, resolved at the moment of running by
+    /// [`Config::verifier_jobs`], because what it resolves to is the machine
+    /// and not the file.
+    pub verifier_jobs: Option<usize>,
 }
 
 impl Config {
+    /// What bounds a `done`: the key when the file sets it, the machine's
+    /// available parallelism when it does not, and one when even that cannot
+    /// be read.
+    pub fn verifier_jobs(&self) -> usize {
+        self.verifier_jobs.unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+        })
+    }
+
     pub fn verifier(&self, name: &str) -> Option<&Verifier> {
         self.verifiers.get(name)
     }
@@ -287,6 +306,18 @@ pub fn parse(text: &str, path: &Path) -> Result<Config> {
         })
     };
 
+    // Zero would be a `done` that runs nothing and waits forever, which no
+    // reader means by writing it.
+    if raw.verifier_jobs == Some(0) {
+        return Err(CliError::new(
+            ExitCode::Generic,
+            format!(
+                "{}: verifier_jobs: 0 runs no verifier, a positive integer is required",
+                path.display()
+            ),
+        ));
+    }
+
     let claim_ttl_max = dur(&raw.claim_ttl_max, "claim_ttl_max")?;
     let claim_ttl_default = dur(&raw.claim_ttl_default, "claim_ttl_default")?;
     let mut verifiers = BTreeMap::new();
@@ -346,6 +377,7 @@ pub fn parse(text: &str, path: &Path) -> Result<Config> {
         roles: raw.roles,
         identities: raw.identities,
         weight: raw.weight,
+        verifier_jobs: raw.verifier_jobs,
     })
 }
 
@@ -769,6 +801,13 @@ fn resolve_key(path: &str) -> Result<Key> {
             name: "claim_ttl_default",
             verbatim: false,
             default: Some(DEFAULT_CLAIM_TTL.to_string()),
+        }),
+        // No default written down: absent, it is the machine's available
+        // parallelism, which is not a value the file could print.
+        ["verifier_jobs"] => Ok(Key::Top {
+            name: "verifier_jobs",
+            verbatim: true,
+            default: None,
         }),
         // No default: absent, the resolution falls back to
         // refs/remotes/origin/HEAD and fails rather than guessing (§7).
@@ -3056,7 +3095,7 @@ mod reference_table {
             }
         }
         let table: BTreeSet<String> = KEYS.iter().map(|k| k.path.to_string()).collect();
-        assert_eq!(accepted.len(), 14, "{accepted:?}");
+        assert_eq!(accepted.len(), 15, "{accepted:?}");
         assert_eq!(table, accepted);
         // What `ank config` addresses is a subset of the table, never a key
         // of its own.
@@ -3123,5 +3162,8 @@ mod reference_table {
             row("weight.plane_bytes"),
             Absent::Number(cfg.weight.plane_bytes)
         );
+        assert_eq!(row("verifier_jobs"), Absent::None);
+        assert_eq!(cfg.verifier_jobs, None);
+        assert!(cfg.verifier_jobs() >= 1);
     }
 }
