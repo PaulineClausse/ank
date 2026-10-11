@@ -390,6 +390,85 @@ pub fn worktree_files(cwd: &Path) -> Option<WorktreeFiles> {
     })
 }
 
+/// Those of `paths` whose working copy differs from the blob HEAD records for
+/// them. A path HEAD does not carry is untracked and is never in the answer.
+///
+/// **Two processes, whatever `paths` holds** (ADR-cc65f1388a71): one
+/// `cat-file --batch-check` answers what HEAD records for every path, one
+/// `hash-object --stdin-paths` what the working copy would record, and the two
+/// are compared here. Both are plumbing ADR-9307e5d214a7 admits, where
+/// `diff-index` is not on its list. `hash-object` reads a path through the
+/// filters git would commit it through, so a checkout converting line endings
+/// compares as git would.
+///
+/// Alignment is positional, on the rule [`preload_at`] states: `--batch-check`
+/// answers exactly one line per input line, in order, a path it cannot resolve
+/// included.
+pub fn differing_from_head(cwd: &Path, paths: &[String]) -> Result<Vec<String>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut input = String::new();
+    for p in paths {
+        input.push_str("HEAD:");
+        input.push_str(p);
+        input.push('\n');
+    }
+    let args = ["cat-file", "--batch-check"];
+    let out = output_with_stdin(cwd, &args, input.as_bytes())?;
+    if !out.status.success() {
+        return Err(failed(&args, &out));
+    }
+    let answers = String::from_utf8_lossy(&out.stdout);
+    let recorded: Vec<Option<&str>> = answers
+        .lines()
+        .map(|l| {
+            let mut parts = l.split(' ');
+            match (parts.next(), parts.next()) {
+                (Some(oid), Some("blob")) => Some(oid),
+                _ => None,
+            }
+        })
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        paths.len(),
+        "cat-file --batch-check answers one line per input line"
+    );
+
+    let tracked: Vec<(&String, &str)> = paths
+        .iter()
+        .zip(&recorded)
+        .filter_map(|(p, oid)| oid.map(|oid| (p, oid)))
+        .collect();
+    if tracked.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut input = String::new();
+    for (p, _) in &tracked {
+        input.push_str(p);
+        input.push('\n');
+    }
+    let args = ["hash-object", "--stdin-paths"];
+    let out = output_with_stdin(cwd, &args, input.as_bytes())?;
+    if !out.status.success() {
+        return Err(failed(&args, &out));
+    }
+    let hashed = String::from_utf8_lossy(&out.stdout);
+    let hashed: Vec<&str> = hashed.lines().collect();
+    assert_eq!(
+        hashed.len(),
+        tracked.len(),
+        "hash-object --stdin-paths answers one line per path"
+    );
+    Ok(tracked
+        .iter()
+        .zip(hashed)
+        .filter(|((_, head), now)| head != now)
+        .map(|((p, _), _)| (*p).clone())
+        .collect())
+}
+
 /// The answer of [`worktree_files`].
 pub struct WorktreeFiles {
     /// The files git counts as this work tree, which a scope is confronted
