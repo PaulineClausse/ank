@@ -5,7 +5,7 @@ slug: ank-signers-sync-reads-a-principal-s-github-sign
 title: ank signers sync reads a principal's GitHub signing keys through gh, and writes them as a diff to review
 created: 2026-10-11T18:26:24Z
 author: claude-code/opus-5.5
-status: proposed
+status: accepted
 scope:
   - crates/ank-cli/src/config.rs
   - crates/ank-cli/src/git.rs
@@ -13,8 +13,12 @@ scope:
   - docs/signing.md
 constraint: |
   A principal under signers: may carry github: <login>, and ank signers sync, an explicit network act and the only one reading GitHub, fetches that login's public ssh and gpg signing keys through gh api, adds those the corpus lacks with note: github, retires (valid_before today, never removes) those marked note: github that GitHub no longer serves, never touches a key added by hand, writes and commits nothing beyond config.yml so the keys bind only once a pull request lands them, and exits 9 naming gh auth login when gh is absent or unauthenticated; no HTTP client enters the binary, and check, accept and every other verb stay offline (ADR-5c6db7a161b8).
+ratified: 1ccb272c7fc2
+verified:
+  - by: haksolot@omarchy
+    at: 2026-10-11T19:04:21Z
 schema: 4
-version: 1
+version: 2
 ---
 
 Builds on ADR-5c6db7a161b8, which moves signers into `config.yml` and makes
