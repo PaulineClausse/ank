@@ -945,6 +945,7 @@ config_keys!(
     "verifiers.<name>.run",
     "verifiers.<name>.timeout",
     "verifiers.<name>.default",
+    "verifier_jobs",
     "weight.hot_files",
     "weight.plane_bytes",
 );

@@ -26602,3 +26602,218 @@ fn status_json_says_when_each_claim_was_taken() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Verifiers run concurrently, bounded by verifier_jobs (TASK-26eab418555a)
+// ---------------------------------------------------------------------------
+
+/// Two verifiers that can only both pass if they run at the same time: each
+/// leaves a marker and then waits for the other's. Concurrency is shown by
+/// what happens and never by a stopwatch (CLAUDE.md): run one at a time, the
+/// first waits for a marker nobody will write until it has finished, and its
+/// timeout is what `done` reports.
+const RENDEZVOUS: &str = "verifiers:\n  \
+     left:\n    run: \"touch left.mark; while [ ! -e right.mark ]; do sleep 0.05; done\"\n    timeout: 10s\n  \
+     right:\n    run: \"touch right.mark; while [ ! -e left.mark ]; do sleep 0.05; done\"\n    timeout: 10s\n";
+
+const JOBS_ID: &str = "TASK-00000000a0b1";
+
+fn jobs_fixture(jobs: Option<u32>, verifiers: &str, verify: &[&str]) -> Repo {
+    let jobs = jobs
+        .map(|n| format!("verifier_jobs: {n}\n"))
+        .unwrap_or_default();
+    let r = Repo::new().with_verifiers(&format!("{jobs}{verifiers}"));
+    r.seed_task_with(JOBS_ID, Some("A criterion."), verify);
+    let out = r.ank("claude-code@ank", &["claim", JOBS_ID]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    r
+}
+
+/// The `proof:` block of a task file, with the HEAD it names replaced, so that
+/// two repositories built alike compare equal on everything else.
+fn proof_block(r: &Repo) -> String {
+    let head: String = r.head().chars().take(7).collect();
+    let text = r.task_text(JOBS_ID);
+    let start = text
+        .find("proof:")
+        .unwrap_or_else(|| panic!("no proof: {text}"));
+    let block: String = text[start..]
+        .lines()
+        .take_while(|l| *l == "proof:" || l.starts_with(' '))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    block.replace(&head, "<head>")
+}
+
+/// What `done` said, less the progress lines, which carry a wall clock.
+fn refusal(out: &Output) -> String {
+    stderr(out)
+        .lines()
+        .filter(|l| !l.starts_with("running:"))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// A verifier that, once started, appends to `beat` ten times a second from a
+/// background process for half a minute. A `beat` that stops growing after
+/// `done` returned is a `done` that left nothing of it running, grandchild
+/// included, measured on all three platforms without reading a pid.
+const HEARTBEAT: &str =
+    "\"(i=0; while [ $i -lt 300 ]; do echo x >> beat; sleep 0.1; i=$((i+1)); done) & wait\"";
+
+fn assert_nothing_beats(r: &Repo) {
+    let size = || {
+        std::fs::metadata(r.0.join("beat"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let before = size();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(
+        size(),
+        before,
+        "a verifier process is still running after done returned"
+    );
+}
+
+#[test]
+fn two_verifiers_waiting_on_each_other_pass_with_two_jobs() {
+    let r = jobs_fixture(Some(2), RENDEZVOUS, &["left", "right"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(r.task_text(JOBS_ID).contains("status: done"));
+    let err = stderr(&out);
+    assert_eq!(err.matches("running: left ... ok").count(), 1, "{err}");
+    assert_eq!(err.matches("running: right ... ok").count(), 1, "{err}");
+}
+
+#[test]
+fn one_job_runs_them_one_at_a_time_and_the_first_times_out() {
+    let r = jobs_fixture(Some(1), RENDEZVOUS, &["left", "right"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("verifier 'left' timed out"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!r.task_text(JOBS_ID).contains("proof:"));
+}
+
+#[test]
+fn verifier_jobs_unset_runs_as_many_as_the_machine_has_cores() {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cores < 2 {
+        eprintln!("skipped: {cores} core available, the clause asks for two");
+        return;
+    }
+    let r = jobs_fixture(None, RENDEZVOUS, &["left", "right"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+#[test]
+fn proof_entries_are_written_in_declared_order_as_a_sequential_run_writes_them() {
+    // The first declared finishes last: completion order and declared order
+    // disagree, which is the case the order has to survive.
+    let verifiers =
+        "verifiers:\n  slow:\n    run: \"sleep 1; echo slow\"\n  fast:\n    run: echo fast\n";
+    let sequential = jobs_fixture(Some(1), verifiers, &["slow", "fast"]);
+    let concurrent = jobs_fixture(Some(2), verifiers, &["slow", "fast"]);
+    for r in [&sequential, &concurrent] {
+        let out = r.ank("claude-code@ank", &["done"]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+    }
+    let block = proof_block(&concurrent);
+    let slow = block.find("verifier: slow@").expect(&block);
+    let fast = block.find("verifier: fast@").expect(&block);
+    assert!(slow < fast, "declared order lost:\n{block}");
+    assert_eq!(block, proof_block(&sequential));
+}
+
+#[test]
+fn a_failing_verifier_answers_as_it_would_sequentially_and_leaves_nothing_running() {
+    let cases: [(&str, &str, i32, &str); 3] = [
+        (
+            "\"sleep 0.3; exit 3\"",
+            "",
+            5,
+            "verifier 'first' failed (exit 3)",
+        ),
+        (
+            "\"sleep 30\"",
+            "    timeout: 1s\n",
+            5,
+            "verifier 'first' timed out",
+        ),
+        (
+            "no-such-command-anywhere-ank",
+            "",
+            9,
+            "verifier 'first' could not run",
+        ),
+    ];
+    for (run, extra, expected, said) in cases {
+        let verifiers = format!(
+            "verifiers:\n  first:\n    run: {run}\n{extra}  second:\n    run: {HEARTBEAT}\n"
+        );
+        let concurrent = jobs_fixture(Some(2), &verifiers, &["first", "second"]);
+        let out = concurrent.ank("claude-code@ank", &["done"]);
+        assert_eq!(code(&out), expected, "{run}: {}", stderr(&out));
+        assert!(stderr(&out).contains(said), "{run}: {}", stderr(&out));
+        let text = concurrent.task_text(JOBS_ID);
+        assert!(
+            !text.contains("proof:"),
+            "{run}: a proof was recorded: {text}"
+        );
+        assert!(!text.contains("status: done"), "{run}: {text}");
+        assert_nothing_beats(&concurrent);
+
+        let sequential = jobs_fixture(Some(1), &verifiers, &["first", "second"]);
+        let seq = sequential.ank("claude-code@ank", &["done"]);
+        assert_eq!(code(&seq), expected, "{run}: {}", stderr(&seq));
+        assert_eq!(refusal(&out), refusal(&seq), "{run}");
+    }
+}
+
+#[test]
+fn the_first_failure_in_declared_order_is_the_one_reported() {
+    // The second fails first in time; sequentially the first would have been
+    // reported, and that is the answer.
+    let verifiers =
+        "verifiers:\n  first:\n    run: \"sleep 1; exit 4\"\n  second:\n    run: \"exit 3\"\n";
+    let r = jobs_fixture(Some(2), verifiers, &["first", "second"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("verifier 'first' failed (exit 4)"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn config_writes_verifier_jobs_and_refuses_zero() {
+    let r = Repo::new();
+    let out = r.ank("claude-code@ank", &["config", "verifier_jobs", "3"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let file = std::fs::read_to_string(r.0.join(".ank/config.yml")).unwrap();
+    assert!(file.contains("verifier_jobs: 3\n"), "{file}");
+
+    for bad in ["0", "-1", "many"] {
+        let out = r.ank("claude-code@ank", &["config", "verifier_jobs", bad]);
+        assert_ne!(code(&out), 0, "{bad} was accepted");
+        // `-1` never reaches the config: the argument parser reads it as a
+        // flag and refuses it there, which is a refusal all the same.
+        if bad != "-1" {
+            assert!(
+                stderr(&out).contains("verifier_jobs"),
+                "{bad}: {}",
+                stderr(&out)
+            );
+        }
+        let after = std::fs::read_to_string(r.0.join(".ank/config.yml")).unwrap();
+        assert_eq!(after, file, "{bad} touched the file");
+    }
+}
