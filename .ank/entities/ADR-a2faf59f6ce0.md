@@ -5,7 +5,7 @@ slug: done-reuses-a-verifier-result-whose-definition-a
 title: done reuses a verifier result whose definition and inputs have not changed, locally or from a hermetic attestation
 created: 2026-10-11T17:42:34Z
 author: claude-code/opus-5.5
-status: proposed
+status: accepted
 scope:
   - crates/ank-cli/src/done.rs
   - crates/ank-cli/src/verify.rs
@@ -13,8 +13,12 @@ scope:
   - crates/ank-core/src/config.rs
 constraint: |
   A verifier result is keyed by name@hash and a digest of the content on disk at execution time (tracked, or untracked and not ignored, files matching inputs, or the whole tree without inputs); every run by done except exit 9 is recorded in an unversioned registry under <git-common-dir>/ank/runs/; done may reuse only a passing local entry with the same key no older than proof.reuse_max_age (default 24h), or a passing attestation with the same key from an executor honouring env for a hermetic verifier, never another machine's local proof and never a failure; a reused entry keeps the via of the run that produced it and carries reused and by, so it is never indistinguishable from an execution for this task; done --fresh reuses nothing.
+ratified: 981093c546c0
+verified:
+  - by: haksolot@omarchy
+    at: 2026-10-11T18:24:00Z
 schema: 4
-version: 1
+version: 2
 ---
 
 Depends on ADR-d8a328e311b9 (a verifier declares its execution environment):
