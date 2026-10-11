@@ -5,7 +5,7 @@ slug: signers-live-in-config-yml-ank-signers-writes-th
 title: Signers live in config.yml, ank signers writes them, and a key is retired by date rather than removed
 created: 2026-10-11T18:26:17Z
 author: claude-code/opus-5.5
-status: proposed
+status: accepted
 scope:
   - crates/ank-cli/src/config.rs
   - crates/ank-core/src/config.rs
@@ -16,8 +16,12 @@ scope:
 constraint: |
   Who may ratify is declared in config.yml under signers:, keyed by principal, each key carrying an optional note and an optional valid_before date, and ank signers (add, retire, remove, migrate) is its only writer, through the surgical config writer, while ank config refuses signers.*; retire sets valid_before so the key ratifies nothing dated after it and what it signed before stays verified, remove is the act for a compromised key and the faults it raises are intended; check reads signers: only, hands git a generated allowed-signers file carrying valid_before as git's valid-before option, judges gpg keys against the committer date itself, and reports a remaining .ank/allowed_signers as a fault naming ank signers migrate; ank signers is a trust act the skills reserve to a human, as they reserve accept.
 amends: [ADR-e45e1a29fe91, ADR-e64dfaafd578]
+ratified: 4571c324e036
+verified:
+  - by: haksolot@omarchy
+    at: 2026-10-11T19:04:21Z
 schema: 4
-version: 1
+version: 2
 ---
 
 ## Context
