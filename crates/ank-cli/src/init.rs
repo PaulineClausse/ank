@@ -268,6 +268,9 @@ fn io(path: &Path, e: std::io::Error) -> CliError {
 pub fn init_at(root: &Path) -> Result<Report> {
     let mut report = Report::default();
     let ank = root.join(repo::ANK_DIR);
+    // Read before anything below creates it: the `AGENTS.md` pointer belongs
+    // to the run that makes the corpus, and only to that one.
+    let creates_corpus = !ank.exists();
 
     // **One directory, and it is the only one this verb makes** (§6). Every
     // entity of every kind lives in `.ank/entities/`, an entry included since
@@ -312,8 +315,15 @@ pub fn init_at(root: &Path) -> Result<Report> {
     let gi = root.join(".gitignore");
     report.wrote_gitignore = ensure_gitignore(&gi)?;
 
-    let agents = root.join("AGENTS.md");
-    report.wrote_agents_pointer = ensure_line(&agents, AGENTS_POINTER)?;
+    // A bootstrap aid and not an invariant (ADR-1f5a45d43f82). `init` is also
+    // the repair verb `status` and `check` name for a missing refspec, and a
+    // repair that re-appended the pointer undid every team that dropped it on
+    // purpose: observed 2026-10-11 in this repository. On an existing corpus
+    // `AGENTS.md` is left as found, created or not.
+    if creates_corpus {
+        let agents = root.join("AGENTS.md");
+        report.wrote_agents_pointer = ensure_line(&agents, AGENTS_POINTER)?;
+    }
 
     match ensure_refspec(root)? {
         OriginFetch::Lacks => report.added_refspec = true,

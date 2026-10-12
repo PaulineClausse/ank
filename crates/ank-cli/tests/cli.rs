@@ -5543,6 +5543,103 @@ fn init_creates_one_directory_and_reports_exactly_the_one_it_creates() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn init_in(dir: &Path) -> Output {
+    ank_command()
+        .args(["init"])
+        .env("ANK_AGENT", "claude-code@ank")
+        .current_dir(dir)
+        .output()
+        .expect("the binary must have been built")
+}
+
+const AGENTS_POINTER_LINE: &str = "This repo uses Ank: tasks and decisions live in `.ank/`.";
+
+/// The run that creates `.ank/` places the `AGENTS.md` pointer and says so,
+/// whether the file was absent or held something else (ADR-1f5a45d43f82).
+#[test]
+fn the_run_that_creates_the_corpus_places_the_agents_pointer() {
+    let absent = fresh_git_dir("init-agents-absent");
+    let out = init_in(&absent);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("pointer added to AGENTS.md"),
+        "{}",
+        stdout(&out)
+    );
+    let agents = std::fs::read_to_string(absent.join("AGENTS.md")).unwrap();
+    assert!(agents.contains(AGENTS_POINTER_LINE), "{agents}");
+
+    let lacking = fresh_git_dir("init-agents-lacking");
+    std::fs::write(lacking.join("AGENTS.md"), "Existing guidance.\n").unwrap();
+    let out = init_in(&lacking);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("pointer added to AGENTS.md"),
+        "{}",
+        stdout(&out)
+    );
+    let agents = std::fs::read_to_string(lacking.join("AGENTS.md")).unwrap();
+    assert!(agents.starts_with("Existing guidance.\n"), "{agents}");
+    assert!(agents.contains(AGENTS_POINTER_LINE), "{agents}");
+
+    let _ = std::fs::remove_dir_all(&absent);
+    let _ = std::fs::remove_dir_all(&lacking);
+}
+
+/// A re-run of `init` on a corpus that already exists leaves `AGENTS.md`
+/// byte for byte as it finds it, and still repairs the refspec
+/// (ADR-1f5a45d43f82, TASK-89ea64037e2d). Observed 2026-10-11 in this
+/// repository: `ank init`, run to add the refspec, re-appended the pointer to
+/// an `AGENTS.md` that had dropped it on purpose.
+#[test]
+fn a_re_run_of_init_leaves_agents_md_as_it_finds_it() {
+    let cases: [(&str, Option<&str>); 3] = [
+        (
+            "holds",
+            Some("Guidance.\n\nThis repo uses Ank: tasks and decisions live in `.ank/`.\n"),
+        ),
+        ("lacks", Some("Guidance, the pointer dropped on purpose.\n")),
+        ("absent", None),
+    ];
+    for (what, content) in cases {
+        let dir = fresh_git_dir(&format!("init-rerun-{what}"));
+        let out = init_in(&dir);
+        assert_eq!(code(&out), 0, "{what}: {}", stderr(&out));
+        let agents = dir.join("AGENTS.md");
+        match content {
+            Some(c) => std::fs::write(&agents, c).unwrap(),
+            None => std::fs::remove_file(&agents).unwrap(),
+        }
+        // The refspec is written only once origin has a URL, so this re-run
+        // has one to add, and the repair half of the clause is exercised.
+        let out = git_command(&dir)
+            .args(["config", "remote.origin.url", "https://example.invalid/r"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+
+        let out = init_in(&dir);
+        assert_eq!(code(&out), 0, "{what}: {}", stderr(&out));
+        let said = stdout(&out);
+        // Byte for byte: the bytes as read, decoded strictly so a failure
+        // prints text, and compared with the literal written above.
+        let after = std::fs::read(&agents)
+            .ok()
+            .map(|b| String::from_utf8(b).expect("AGENTS.md is not UTF-8"));
+        assert_eq!(
+            after.as_deref(),
+            content,
+            "{what}: a re-run changed AGENTS.md:\n{said}"
+        );
+        assert!(!said.contains("AGENTS.md"), "{what}: {said}");
+        assert!(
+            said.contains(&format!("refspec added: {}", init_refspec())),
+            "{what}: the re-run did not repair the refspec:\n{said}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// `init` refuses `--repo` by name, and writes nowhere while doing it.
 ///
 /// The shape of the fixture is the defect: the process runs **inside** one
