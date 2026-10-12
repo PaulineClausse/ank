@@ -1250,6 +1250,93 @@ fn a_watching_cycle_moves_the_tracking_namespace_and_nothing_else() {
     );
 }
 
+/// The same negative, in a clone that carries `+refs/ank/*:refs/ank/*`
+/// (TASK-625d3bf0c9a1).
+///
+/// The configured refspec is the case the test above cannot see. Given a
+/// refspec of its own, `git fetch` still runs its opportunistic update of
+/// every configured remote-tracking ref the fetched refs match, and init's
+/// refspec maps `refs/ank/claims/*` onto itself: the mirror would then land on
+/// the plane it exists to stay off, and rewrite a live lease from the remote.
+/// Every clone carries that refspec once its first `status` has run
+/// (ADR-1b030fe70442), so this is the ordinary clone and not a corner.
+#[test]
+fn a_watching_cycle_leaves_the_claims_alone_where_the_refs_ank_refspec_is_configured() {
+    let home = Home::new();
+    let root = scratch("refmap");
+    let origin = root.join("origin.git");
+    bare(&home, &origin);
+
+    let seed = Corpus::new(root.join("seed"), &home);
+    seed.git(
+        &home,
+        &["config", "remote.origin.url", &origin.display().to_string()],
+    );
+    seed.git(&home, &["push", "-q", "-u", "origin", "main"]);
+
+    let mine = clone(&home, &origin, &root.join("mine"));
+    mine.git(
+        &home,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/ank/*:refs/ank/*",
+        ],
+    );
+    let task = mine.task_id(&home);
+    mine.ank_as(
+        &home,
+        "mine@ank.local",
+        &["claim", &task, "--criteria", "the mirror never touches it"],
+    );
+
+    // Origin moves under this clone: its claim rewritten, and a claim on a
+    // task it has never held. Both are refs the opportunistic update would
+    // bring onto refs/ank/claims/* here.
+    let record = root.join("forged.yml");
+    std::fs::write(&record, "state: claim\nholder: someone-else@host\n").unwrap();
+    let blob = seed.git(&home, &["hash-object", "-w", &record.display().to_string()]);
+    let blob = String::from_utf8_lossy(&blob.stdout).trim().to_string();
+    let other = "TASK-0000000000ff";
+    seed.git(
+        &home,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("+{blob}:refs/ank/claims/{task}"),
+            &format!("+{blob}:refs/ank/claims/{other}"),
+        ],
+    );
+
+    home.declare(&format!(
+        "schema: 1\nfetch: 1\nwatch:\n  {}: {}\n",
+        mine.identity(&home),
+        mine.root.display()
+    ));
+    let claims = mine.ank_refs(&home, "refs/ank/claims");
+    assert!(
+        claims.contains(&format!("refs/ank/claims/{task}")),
+        "the fixture holds a claim of its own: {claims}"
+    );
+
+    let out = home.daemon(&["--once"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    assert!(
+        mine.ank_refs(&home, "refs/ank/watch")
+            .contains(&format!("refs/ank/watch/origin/claims/{other}")),
+        "the mirror is what the cycle was for: {}",
+        mine.ank_refs(&home, "refs/ank")
+    );
+    assert_eq!(
+        mine.ank_refs(&home, "refs/ank/claims"),
+        claims,
+        "the mirror landed on refs/ank/claims through the configured refspec"
+    );
+}
+
 /// The mirror carries claims and nothing else (ADR-4b45f344344f,
 /// TASK-21de469a0029).
 ///
