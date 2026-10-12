@@ -13843,7 +13843,10 @@ const GLOB_FLAGS: [(&str, &str); 3] = [
 /// path if it is called `--scope`" — is exactly what would let the next
 /// `--under <glob>` through in silence, which is the failure this whole task is
 /// a correction of.
-const NOT_A_PATH: [&str; 38] = [
+const NOT_A_PATH: [&str; 39] = [
+    // Carries no value at all: `accept --pr` names nothing, it carries the
+    // ratifications to a pull request (ADR-2a63c0c87691).
+    "--pr",
     // Carries no value at all: the directory it writes is made under the
     // temporary directory by the verb, and nothing about it comes off the
     // command line (ADR-e1d750884b82).
@@ -26651,6 +26654,27 @@ fn refusal(out: &Output) -> String {
         .collect()
 }
 
+/// A refusal with the duration of a timeout masked. The message prints the
+/// elapsed time as measured, which no two runs share to the tenth of a second
+/// under load, so it is the one part of the message the sequential run cannot
+/// be expected to reproduce.
+fn elapsed_masked(refusal: &str) -> String {
+    const AT: &str = "timed out after ";
+    let mut masked = String::new();
+    let mut rest = refusal;
+    while let Some(i) = rest.find(AT) {
+        let (head, tail) = rest.split_at(i + AT.len());
+        masked.push_str(head);
+        let digits = tail
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(tail.len());
+        masked.push_str("<elapsed>");
+        rest = &tail[digits..];
+    }
+    masked.push_str(rest);
+    masked
+}
+
 /// A verifier that, once started, appends to `beat` ten times a second from a
 /// background process for half a minute. A `beat` that stops growing after
 /// `done` returned is a `done` that left nothing of it running, grandchild
@@ -26770,8 +26794,31 @@ fn a_failing_verifier_answers_as_it_would_sequentially_and_leaves_nothing_runnin
         let sequential = jobs_fixture(Some(1), &verifiers, &["first", "second"]);
         let seq = sequential.ank("claude-code@ank", &["done"]);
         assert_eq!(code(&seq), expected, "{run}: {}", stderr(&seq));
-        assert_eq!(refusal(&out), refusal(&seq), "{run}");
+        assert_eq!(
+            elapsed_masked(&refusal(&out)),
+            elapsed_masked(&refusal(&seq)),
+            "{run}"
+        );
     }
+}
+
+#[test]
+fn a_refusal_differing_only_by_the_elapsed_time_compares_equal() {
+    let at = |t: &str| format!("error[5]: verifier 'first' timed out after {t}s\n");
+    assert_eq!(elapsed_masked(&at("1.1")), elapsed_masked(&at("1.2")));
+    assert_eq!(elapsed_masked(&at("1.0")), elapsed_masked(&at("600.0")));
+    assert_ne!(
+        elapsed_masked(&at("1.1")),
+        elapsed_masked("error[5]: verifier 'second' timed out after 1.1s\n")
+    );
+    assert_ne!(
+        elapsed_masked(&at("1.1")),
+        elapsed_masked("error[9]: verifier 'first' timed out after 1.1s\n")
+    );
+    assert_ne!(
+        elapsed_masked("verifier 'first' failed (exit 3)\n"),
+        elapsed_masked("verifier 'first' failed (exit 4)\n")
+    );
 }
 
 #[test]

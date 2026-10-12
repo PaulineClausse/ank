@@ -970,6 +970,17 @@ config_keys!(
 // 0 with the local write standing; `attest --detached` exits 9; `accept` writes
 // no ref under `refs/ank/` at all, and neither does `init`.
 
+/// One ratification, as `accept` reports it: the whole document for one id,
+/// and a row of `accepted` for several or with `--pr`.
+const ACCEPTED: &[Field] = &[
+    f("id", Type::Str),
+    f("kind", Type::Str),
+    f("status", Type::Str),
+    opt("superseded", Type::Str),
+    f("commit", Type::Str),
+    f("anchor", Type::Str),
+];
+
 /// The verb wrote to disk as well, so the ref is not the whole product and the
 /// exit code does not depend on the push (§2).
 pub const PUSH_DEGRADES: &str =
@@ -1340,12 +1351,15 @@ pub const COMMANDS: &[CommandSpec] = &[
         group: "shape the work",
         renews: Renews::Never,
         coordinates: true,
-        summary: "promotes a proposed ADR or spec to accepted, through a signed ratification commit; on the default branch only",
+        summary: "promotes proposed ADRs or specs to accepted, one signed ratification commit each; on the default branch only, and --pr carries them to a pull request",
         subcommands: &[],
         kinds: &[],
-        max_positionals: 1,
-        positional_help: "<id>",
-        flags: &[],
+        // As many ids as the caller names, each its own commit: the subject
+        // `ratify <id>` is the anchor, so two ratifications never share one
+        // (ADR-2a63c0c87691).
+        max_positionals: usize::MAX,
+        positional_help: "<id>...",
+        flags: &[switch("--pr")],
         refuses: &[
             refuses(ExitCode::NotFound, "no such entity, or the prefix matches more than one"),
             refuses(ExitCode::Prerequisite, "not on the default branch, and there is no way around it"),
@@ -1362,6 +1376,25 @@ pub const COMMANDS: &[CommandSpec] = &[
                 ExitCode::Environment,
                 "the default branch cannot be determined, from config.yml or from origin",
             ),
+            // The --pr prerequisites, every one checked before the first commit
+            // (ADR-2a63c0c87691): 9 where the environment needs repairing, 7
+            // where the tree is not in the state the carry needs.
+            refuses(
+                ExitCode::Environment,
+                "--pr: the default branch has no upstream to reset to and push beside",
+            ),
+            refuses(
+                ExitCode::Environment,
+                "--pr: gh is not on PATH, or gh auth status says it is not authenticated",
+            ),
+            refuses(
+                ExitCode::Prerequisite,
+                "--pr: a tracked file outside .ank/ differs from HEAD, the default branch is not level with its upstream, or the ratify/ branch already exists",
+            ),
+            refuses(
+                ExitCode::Environment,
+                "--pr: the push or gh pr create failed after the commits, which stay on the ratify/ branch; the message names the command that finishes the job",
+            ),
             UNPARSEABLE_CALL,
             ENTITY_MOVED,
             refuses(
@@ -1372,15 +1405,25 @@ pub const COMMANDS: &[CommandSpec] = &[
         notes: &[
             "the one act ank commits for; it is a human act, signed",
             "the citations of the retired document are re-pointed first: the refusal names every site with its line, is not suppressed by --quiet, and there is no flag around it",
-            // The ratification is a commit, and a commit reaches the default
-            // branch through a pull request rather than through this verb. It
-            // coordinates — it needs git and it needs the default branch — so a
-            // caller has every reason to expect a push here, and gets told there
-            // is none.
-            PUSH_NONE,
+            "--pr creates ratify/<first id> at the last ratification, resets the default branch to its upstream, pushes the branch, opens a pull request with gh, prints gh pr merge ratify/<id> --merge, and never merges",
+            // Without --pr the ratification is a commit, and it reaches the
+            // default branch through a pull request rather than through this
+            // verb; with --pr the push is the point of the call, and a refused
+            // one is a failure the message names the way out of.
+            PUSH_FAILS,
         ],
         refuses_globals: &[],
-        output: &[one(&[f("id", Type::Str), f("kind", Type::Str), f("status", Type::Str), opt("superseded", Type::Str), f("commit", Type::Str), f("anchor", Type::Str)])],
+        output: &[
+            when("one id, without --pr", ACCEPTED),
+            when(
+                "several ids, or --pr",
+                &[
+                    f("accepted", Type::Array(ACCEPTED)),
+                    opt("branch", Type::Str),
+                    opt("merge", Type::Str),
+                ],
+            ),
+        ],
         owner_task: None,
     },
     // Between `accept` and `close`: §4's order, and beside the verb this one was

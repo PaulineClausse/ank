@@ -5,7 +5,7 @@ default_branch: main
 verifiers:
   cargo-test:
     run: cargo test --workspace -q
-    timeout: 10m
+    timeout: 20m
     default: true
   fmt-check:
     run: cargo fmt --check

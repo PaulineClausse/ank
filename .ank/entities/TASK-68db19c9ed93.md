@@ -5,7 +5,7 @@ slug: ank-accept-takes-several-ids-and-pr-carries-them
 title: ank accept takes several ids, and --pr carries them to a pull request
 created: 2026-10-11T18:26:57Z
 author: claude-code/opus-5.5
-status: open
+status: done
 scope:
   - crates/ank-cli/src/human.rs
   - crates/ank-cli/src/git.rs
@@ -17,8 +17,21 @@ done_criteria: |
 criteria_by: creator
 verify: [cargo-test, fmt-check]
 method: tdd
+proof:
+  - type: test
+    ref: local/3a38d3e84e96@f4aee5b
+    tree: scope/fdcc7a6f6ae9
+    criteria: 6140b12a0d49
+    verifier: cargo-test@f14aeab36e1b
+    via: verifier
+  - type: test
+    ref: local/e3b0c44298fc@f4aee5b
+    tree: scope/fdcc7a6f6ae9
+    criteria: 6140b12a0d49
+    verifier: fmt-check@5ca6d10bcd55
+    via: verifier
 schema: 4
-version: 1
+version: 2
 ---
 
 Implements ADR-2a63c0c87691. Independent of the signers tasks.
