@@ -89,6 +89,13 @@ pub enum Fetched {
 /// build mirrored beside the claims stays where it is: removing it is a
 /// person's act, one ref by name (ADR-4b45f344344f).
 ///
+/// `--refmap=`, empty, because a refspec on the command line does not stop git
+/// updating the remote-tracking refs the *configured* refspecs map the fetched
+/// refs to. `init`'s `+refs/ank/*:refs/ank/*` maps `refs/ank/claims/*` onto
+/// itself, so without it a cycle rewrote this clone's own claims from the
+/// remote and brought other clones' onto the local plane (TASK-625d3bf0c9a1),
+/// which is the one thing ADR-24e21cb83793 says the watcher never does.
+///
 /// `Err` carries the first line of git's own complaint, which is what a person
 /// reading the log needs and is never parsed by anything here: the exit code is
 /// what decided, as ADR-9307e5d214a7 requires.
@@ -105,6 +112,7 @@ pub fn mirror(root: &Path) -> Result<Fetched, String> {
             "--no-tags",
             "--no-write-fetch-head",
             "--no-recurse-submodules",
+            "--refmap=",
             "origin",
             spec.as_str(),
         ])
