@@ -169,7 +169,10 @@ $ git init -q --bare ../origin.git && git remote add origin ../origin.git
     signal: origin: remote.origin.fetch lacks +refs/ank/*:refs/ank/*, so claims and completion refs are never fetched (ank init)
 
 A second `ank init` adds the refspec, prints `refspec added:
-+refs/ank/*:refs/ank/*`, and both go quiet.
++refs/ank/*:refs/ank/*`, and both go quiet. It leaves `AGENTS.md` as it finds
+it: the pointer is written by the run that creates `.ank/` and by no later one,
+so a repository that dropped it on purpose keeps it dropped through every
+repair (ADR-1f5a45d43f82).
 
 Without a remote, `git worktree`s of a single clone are still arbitrated,
 because they share `refs/ank/`. **Two clones with no common origin are not
