@@ -924,6 +924,18 @@ impl Repo {
             let out = git_command(&other).args(args).output().unwrap();
             assert!(out.status.success(), "{args:?}: {}", stderr(&out));
         }
+        // Both carry the `refs/ank/*` refspec, as `init` writes it once origin
+        // exists. Without it the first `status` or `check` in either adds it
+        // and fetches the namespace (ADR-1b030fe70442), and every test built
+        // on this fixture is about a clone that has *not* fetched since: the
+        // steady state, where a ref origin moves stays unseen here.
+        for at in [&self.0, &other] {
+            let out = git_command(at)
+                .args(["config", "--add", "remote.origin.fetch", init_refspec()])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", stderr(&out));
+        }
         (origin, other)
     }
 
@@ -6368,7 +6380,19 @@ fn status_names_the_refs_this_checkout_holds_that_origin_has_moved_past() {
         here, head,
         "the fixture moved origin to where it already was"
     );
-    r.git(&["push", "-q", "origin", &format!("+{head}:{refname}")]);
+    // From the other clone: with the `refs/ank/*` refspec configured, git
+    // updates the local ref a push names to what it pushed, so a push made
+    // here would move this checkout along with origin and leave nothing stale.
+    let out = git_command(&other)
+        .args(["push", "-q", "origin", &format!("+{head}:{refname}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "push: {}", stderr(&out));
+    assert_eq!(
+        r.git(&["rev-parse", &refname]),
+        here,
+        "the fixture moved this checkout's ref along with origin's"
+    );
 
     // A ref origin holds that this checkout has never seen, which is the other
     // half of the count.
@@ -6552,6 +6576,10 @@ fn a_claim_a_watcher_mirrored_is_reported_by_status_and_by_nothing_else() {
         "--prune",
         "--no-tags",
         "--no-write-fetch-head",
+        // As the watcher passes it (TASK-625d3bf0c9a1): this clone carries
+        // init's refspec, and without an empty refmap git would also update
+        // the refs/ank/claims/* it maps the fetched refs onto.
+        "--refmap=",
         "origin",
         "+refs/ank/*:refs/ank/watch/origin/*",
     ]);
@@ -6614,6 +6642,10 @@ fn a_claim_a_watcher_mirrored_is_reported_by_status_and_by_nothing_else() {
         "--prune",
         "--no-tags",
         "--no-write-fetch-head",
+        // As the watcher passes it (TASK-625d3bf0c9a1): this clone carries
+        // init's refspec, and without an empty refmap git would also update
+        // the refs/ank/claims/* it maps the fetched refs onto.
+        "--refmap=",
         "origin",
         "+refs/ank/*:refs/ank/watch/origin/*",
     ]);
@@ -17829,19 +17861,11 @@ fn attestable() -> (Repo, PathBuf) {
     );
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
 
+    // `cloned` installs what `ank init` installs on both sides, and that is
+    // the reason ADR-493471d64ba0 says an existing repository needs no
+    // configuration change: one refspec already carries every namespace under
+    // refs/ank/, this one included.
     let (_origin, other) = r.cloned();
-    // What `ank init` installs, and the reason ADR-493471d64ba0 says an
-    // existing repository needs no configuration change: one refspec already
-    // carries every namespace under refs/ank/, this one included. Both sides
-    // get it, because `cloned` wires the remote on the original too and the
-    // reading clone is the one that needs the fetch to bring anything.
-    for at in [&r.0, &other] {
-        let out = git_command(at)
-            .args(["config", "--add", "remote.origin.fetch", init_refspec()])
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", stderr(&out));
-    }
     (r, other)
 }
 

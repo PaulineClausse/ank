@@ -56,6 +56,22 @@ pub fn run(
         None
     };
 
+    // **What origin fetches, asked once and repaired when it lacks the
+    // refspec** (TASK-623d80886c2f, ADR-1b030fe70442). Asked here, before the
+    // plane below is read, because the repair fetches `refs/ank/*` and the
+    // plane has to see what it brought. It is also a line of its own further
+    // down, a finding `check` counts, and part of the key the cached verdict
+    // hangs on: `.git/config` is in no file the index digests. One `git
+    // config` process in a clone that has the refspec, handed to the
+    // inspection rather than asked a second time (ADR-cc65f1388a71).
+    let origin = coordinated.then(|| {
+        let (origin, repaired) = crate::init::repair_origin(&repo.corpus);
+        if let Some(line) = repaired.filter(|_| !inv.quiet()) {
+            eprintln!("{line}");
+        }
+        origin
+    });
+
     let index = Index::open(&repo.ank)?;
     let rows = index.all()?;
 
@@ -291,14 +307,6 @@ pub fn run(
     // state and not an absence — the two collapse here because neither names a
     // commit to compare a corpus against.
     let default_branch = default.as_ref().and_then(|d| d.as_ref().ok()).cloned();
-
-    // **What origin fetches, asked once** (TASK-623d80886c2f). It is a line of
-    // its own below, it is a finding `check` counts, and so it is part of the
-    // key the cached verdict hangs on: `.git/config` is in no file the index
-    // digests, and a verdict keyed without it would go on counting a signal
-    // `ank init` has already repaired. One `git config` process, handed to the
-    // inspection rather than asked a second time (ADR-cc65f1388a71).
-    let origin = coordinated.then(|| crate::init::origin_fetch(&repo.corpus));
 
     // **The corpus verdict, and where it comes from is the whole of what
     // changed here** (ADR-f3d1dea65d84). It used to be `human::inspect`

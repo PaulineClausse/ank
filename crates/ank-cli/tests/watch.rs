@@ -1002,9 +1002,12 @@ fn the_only_thing_it_writes_into_a_repository_is_the_index() {
 /// clone cannot show that, because there is no second plane for the first to be
 /// stale about, and a test that tried would be measuring nothing.
 ///
-/// The second clone is made by `git clone` and never by `ank init`, so it
-/// carries no `+refs/ank/*:refs/ank/*` refspec: without the watcher there is no
-/// route by which a claim taken elsewhere reaches it at all.
+/// The second clone is made by `git clone` and then given the
+/// `+refs/ank/*:refs/ank/*` refspec its first `status` would add on its own
+/// (ADR-1b030fe70442): that repair fetches once, at the transition, and the
+/// state this test is about is the one after it, where nobody fetches again.
+/// Without the watcher there is then no route by which a claim taken elsewhere
+/// reaches it at all.
 #[test]
 fn a_claim_taken_in_one_clone_is_reported_by_status_in_the_other() {
     let home = Home::new();
@@ -1021,6 +1024,15 @@ fn a_claim_taken_in_one_clone_is_reported_by_status_in_the_other() {
     );
     first.git(&home, &["push", "-q", "-u", "origin", "main"]);
     let second = clone(&home, &origin, &root.join("second"));
+    second.git(
+        &home,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/ank/*:refs/ank/*",
+        ],
+    );
     assert_eq!(first.identity(&home), second.identity(&home));
     let task = first.task_id(&home);
 

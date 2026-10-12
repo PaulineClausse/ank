@@ -212,7 +212,17 @@ impl Report {
 
 pub fn check(inv: &Invocation, repo: &Repo, cfg: &Config, out: &mut dyn Write) -> Result<ExitCode> {
     let path = crate::context::perimeter(inv, repo)?;
-    let report = inspect(repo, cfg, path.as_deref(), true)?;
+    // Repaired before the inspection reads a single ref, so the proofs the
+    // fetch brings are the ones it counts (ADR-1b030fe70442). Only where git
+    // runs here: a check outside a repository starts no process for it.
+    let origin = git::usable_here(&repo.corpus).then(|| {
+        let (origin, repaired) = crate::init::repair_origin(&repo.corpus);
+        if let Some(line) = repaired.filter(|_| !inv.quiet()) {
+            eprintln!("{line}");
+        }
+        origin
+    });
+    let report = inspect_with(repo, cfg, path.as_deref(), true, origin)?;
     render(&report, inv, out);
     Ok(report.exit_code())
 }

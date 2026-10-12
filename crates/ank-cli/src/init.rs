@@ -476,6 +476,44 @@ fn ensure_refspec(root: &Path) -> Result<OriginFetch> {
     Ok(found)
 }
 
+/// What `origin` fetches, repaired when it lacks [`REFSPEC`] (ADR-1b030fe70442),
+/// with the line that says so.
+///
+/// Every clone starts without the refspec, because `git clone` does not carry
+/// `remote.origin.fetch`, and until it was added by hand `check` asserted an
+/// absence it could not observe: 214 `done with no test proof` signals in a
+/// fresh clone of this repository at fb17a26a, every one of them attested on
+/// origin. So a verb that already asks this question repairs the answer it
+/// gets: the refspec is added through the writer `init` uses, and `refs/ank/*`
+/// is fetched once, at the transition. A clone that has the refspec pays
+/// nothing beyond the question it was already asking; with no origin nothing
+/// is written, for the reason [`ensure_refspec`] gives.
+///
+/// **A failed fetch is not an error.** The refspec stays written and the next
+/// `git fetch` brings the refs; the verb answers on what this clone holds, as
+/// it does with the refspec present and origin unreachable. A refspec that
+/// could not be written is left as `Lacks`, so `status` and `check` keep
+/// saying so.
+pub fn repair_origin(root: &Path) -> (OriginFetch, Option<String>) {
+    let found = origin_fetch(root);
+    if found != OriginFetch::Lacks {
+        return (found, None);
+    }
+    if ensure_refspec(root).is_err() {
+        return (OriginFetch::Lacks, None);
+    }
+    let fetched = git::fetch_ref(root, "refs/ank/*").unwrap_or(false);
+    let line = if fetched {
+        format!("refspec added: {REFSPEC}, and refs/ank/* fetched from origin")
+    } else {
+        format!(
+            "refspec added: {REFSPEC}; refs/ank/* could not be fetched from \
+             origin, the next git fetch brings them"
+        )
+    };
+    (OriginFetch::Fetches, Some(line))
+}
+
 /// What `origin` fetches, as far as `refs/ank/*` is concerned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginFetch {
