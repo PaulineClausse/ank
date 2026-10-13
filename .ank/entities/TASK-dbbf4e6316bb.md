@@ -5,7 +5,7 @@ slug: the-test-verifier-and-ci-run-the-suite-under-car
 title: The test verifier and CI run the suite under cargo-nextest
 created: 2026-10-13T10:11:06Z
 author: claude-code/2.x
-status: open
+status: done
 scope:
   - .ank/config.yml
   - .github/workflows/ci.yml
@@ -17,8 +17,21 @@ done_criteria: |
   The cargo-test verifier and the CI test job run cargo nextest run --workspace; cargo nextest list counts exactly as many tests as cargo test -- --list, both counts recorded with ank log; the ank-tui tests serialised today by an in-process lock run in a nextest test group with max-threads 1; ank done with cargo-nextest absent from PATH exits 9; CONTRIBUTING says how to install it; the CI run on the change is green on all three platforms.
 criteria_by: creator
 verify: [cargo-test, fmt-check]
+proof:
+  - type: test
+    ref: local/e853edc302b8@1bbeaa1
+    tree: scope/f1eef2f01225
+    criteria: 3f65a0321705
+    verifier: cargo-test@fcf98015afba
+    via: verifier
+  - type: test
+    ref: local/e3b0c44298fc@1bbeaa1
+    tree: scope/f1eef2f01225
+    criteria: 3f65a0321705
+    verifier: fmt-check@5ca6d10bcd55
+    via: verifier
 schema: 4
-version: 6
+version: 8
 ---
 
 Applies ADR-8c12a38531e3 once it is ratified; do not claim before. The
