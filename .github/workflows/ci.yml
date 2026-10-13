@@ -104,9 +104,28 @@ jobs:
           fi
           echo "CRLF fixture intact"
 
+      # The suite runs under cargo-nextest, as the `cargo-test` verifier does
+      # (ADR-8c12a38531e3): `cargo test` runs the test binaries one after
+      # another, and on windows-latest that sequence was the whole length of a
+      # run. Installed from its published binary at a pinned version, for the
+      # reason the cache and the toolchain above give: no third-party action.
+      - name: cargo-nextest
+        shell: bash
+        env:
+          NEXTEST_VERSION: 0.9.148
+        run: |
+          case "$RUNNER_OS" in
+            Linux) platform=linux ;;
+            macOS) platform=mac ;;
+            Windows) platform=windows-tar ;;
+          esac
+          curl -LsSf "https://get.nexte.st/$NEXTEST_VERSION/$platform" | tar zxf - -C "$HOME/.cargo/bin"
+          cargo nextest --version
+
       - run: cargo fmt --check
 
-      - run: cargo test --workspace
+      # The `ci` profile of .config/nextest.toml runs every test to the end.
+      - run: cargo nextest run --workspace --profile ci
 
       # The tool validates its own corpus with its own command. This is the same
       # line as the `check-repo` verifier in .ank/config.yml, and it has to stay
