@@ -125,7 +125,18 @@ jobs:
       - run: cargo fmt --check
 
       # The `ci` profile of .config/nextest.toml runs every test to the end.
+      #
+      # Under bash, on every platform, and on windows-latest that is load-bearing
+      # (TASK-d08e4110f6c1). Git for Windows mounts /tmp from the TEMP of the
+      # first MSYS process and keeps that mount while any MSYS process lives.
+      # Under nextest the suite's own `sh` children overlap without a gap, so
+      # without a long-lived one the mount stays pinned to some test's scratch
+      # TEMP after that directory is swept, every later `sh` prints "could not
+      # find /tmp", and a verifier's output stops being what a page shows. The
+      # step's bash is that long-lived process, holding the runner's TEMP, as
+      # `sh -c` already is when the `cargo-test` verifier runs this suite.
       - run: cargo nextest run --workspace --profile ci
+        shell: bash
 
       # The tool validates its own corpus with its own command. This is the same
       # line as the `check-repo` verifier in .ank/config.yml, and it has to stay
