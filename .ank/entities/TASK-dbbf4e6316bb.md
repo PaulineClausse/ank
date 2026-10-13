@@ -11,13 +11,14 @@ scope:
   - .github/workflows/ci.yml
   - CONTRIBUTING.md
   - crates/ank-tui/tests/**
-blocked_by: []
+  - .config/nextest.toml
+blocked_by: [TASK-d08e4110f6c1]
 done_criteria: |
   The cargo-test verifier and the CI test job run cargo nextest run --workspace; cargo nextest list counts exactly as many tests as cargo test -- --list, both counts recorded with ank log; the ank-tui tests serialised today by an in-process lock run in a nextest test group with max-threads 1; ank done with cargo-nextest absent from PATH exits 9; CONTRIBUTING says how to install it; the CI run on the change is green on all three platforms.
 criteria_by: creator
 verify: [cargo-test, fmt-check]
 schema: 4
-version: 2
+version: 6
 ---
 
 Applies ADR-8c12a38531e3 once it is ratified; do not claim before. The

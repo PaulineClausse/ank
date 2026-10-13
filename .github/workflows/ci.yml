@@ -104,9 +104,39 @@ jobs:
           fi
           echo "CRLF fixture intact"
 
+      # The suite runs under cargo-nextest, as the `cargo-test` verifier does
+      # (ADR-8c12a38531e3): `cargo test` runs the test binaries one after
+      # another, and on windows-latest that sequence was the whole length of a
+      # run. Installed from its published binary at a pinned version, for the
+      # reason the cache and the toolchain above give: no third-party action.
+      - name: cargo-nextest
+        shell: bash
+        env:
+          NEXTEST_VERSION: 0.9.148
+        run: |
+          case "$RUNNER_OS" in
+            Linux) platform=linux ;;
+            macOS) platform=mac ;;
+            Windows) platform=windows-tar ;;
+          esac
+          curl -LsSf "https://get.nexte.st/$NEXTEST_VERSION/$platform" | tar zxf - -C "$HOME/.cargo/bin"
+          cargo nextest --version
+
       - run: cargo fmt --check
 
-      - run: cargo test --workspace
+      # The `ci` profile of .config/nextest.toml runs every test to the end.
+      #
+      # Under bash, on every platform, and on windows-latest that is load-bearing
+      # (TASK-d08e4110f6c1). Git for Windows mounts /tmp from the TEMP of the
+      # first MSYS process and keeps that mount while any MSYS process lives.
+      # Under nextest the suite's own `sh` children overlap without a gap, so
+      # without a long-lived one the mount stays pinned to some test's scratch
+      # TEMP after that directory is swept, every later `sh` prints "could not
+      # find /tmp", and a verifier's output stops being what a page shows. The
+      # step's bash is that long-lived process, holding the runner's TEMP, as
+      # `sh -c` already is when the `cargo-test` verifier runs this suite.
+      - run: cargo nextest run --workspace --profile ci
+        shell: bash
 
       # The tool validates its own corpus with its own command. This is the same
       # line as the `check-repo` verifier in .ank/config.yml, and it has to stay

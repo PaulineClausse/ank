@@ -1,0 +1,22 @@
+# cargo-nextest runs the suite for the `cargo-test` verifier and the CI `test`
+# job (ADR-8c12a38531e3): one pool for every test of every binary, so the
+# binaries no longer wait for each other.
+
+# Six suites of ank-tui open pseudo-terminals, and under `cargo test` each took
+# them in turn through an in-process `ONE_AT_A_TIME` lock: `ptsname(3)` answers
+# out of a static buffer, so two sessions opened at once in one process can be
+# handed the same slave path (LOG-3b0bc419c884). Under nextest every test is its
+# own process and that lock serialises nothing, so the group carries the
+# constraint instead.
+[test-groups]
+pty-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(ank-tui) & (binary(bindings) | binary(colour) | binary(edit) | binary(overlay) | binary(search) | binary(verbs))'
+test-group = 'pty-serial'
+
+# CI runs every test to the end: whether a failure is one platform's or every
+# platform's is the information a run is for, as `fail-fast: false` already says
+# for the matrix.
+[profile.ci]
+fail-fast = false
