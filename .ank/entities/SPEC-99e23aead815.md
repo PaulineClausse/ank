@@ -5,12 +5,16 @@ slug: intent-principles-and-what-v1-leaves-out
 title: Intent, principles, and what v1 leaves out
 created: 2026-10-14T10:17:23Z
 author: claude-code/fable-5.1+plan
-status: proposed
+status: accepted
 scope:
   - "**"
 supersedes: SPEC-1d5b44efd388
+ratified: 8b61e5fbee64
+verified:
+  - by: seanl@sean-laptop
+    at: 2026-10-14T13:37:26Z
 schema: 4
-version: 1
+version: 2
 ---
 
 This is one of the ten documents that carry the Ank specification, and it is the
