@@ -2,7 +2,7 @@
 id: TASK-dc04757dfecb
 type: task
 slug: a-verifier-declares-inputs-and-env-and-its-defin
-title: A verifier declares inputs and env, and its definition hash covers both
+title: A verifier declares inputs, its definition hash covers them, and env is refused by name
 created: 2026-10-13T10:11:05Z
 author: claude-code/2.x
 status: open
@@ -12,11 +12,11 @@ scope:
   - crates/ank-cli/src/verify.rs
 blocked_by: []
 done_criteria: |
-  Through the binary: ank config verifiers.<name>.inputs and the env keys of ADR-d8a328e311b9 are written to config.yml and read back; the verifier definition hash changes when inputs or env changes and is unchanged for a verifier declaring neither; an env image given by tag rather than sha256 digest is refused at parse time; check reports a changed inputs or env as it reports any verifier change; SPEC-fe67fbaa2708 names inputs and env and states what the definition hash covers.
+  Through the binary: ank config verifiers.<name>.inputs writes inputs globs to config.yml and reads them back; the verifier definition hash changes when inputs changes and is unchanged for a verifier declaring none; ank config verifiers.<name>.env.image is refused by name as a key the parser does not know, and a config.yml carrying an env block under a verifier fails to load naming the key; check reports a changed inputs as it reports any verifier change; SPEC-fe67fbaa2708 names inputs, states what the definition hash covers, and names no env.
 criteria_by: creator
 verify: [cargo-test, fmt-check]
 schema: 4
-version: 1
+version: 3
 ---
 
 Implements ADR-d8a328e311b9, accepted and never coded. Today `VerifierFile`
