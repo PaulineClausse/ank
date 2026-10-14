@@ -48,5 +48,6 @@ mod spec_page;
 mod status;
 mod tui;
 mod update;
+mod verifier_env;
 mod warm_readers;
 mod watch;
