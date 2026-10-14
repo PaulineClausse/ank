@@ -5,7 +5,7 @@ slug: a-verifier-declares-inputs-and-env-and-its-defin
 title: A verifier declares inputs and env, and its definition hash covers both
 created: 2026-10-13T10:11:05Z
 author: claude-code/2.x
-status: open
+status: in_progress
 scope:
   - crates/ank-core/src/config.rs
   - crates/ank-cli/src/config.rs
@@ -16,7 +16,7 @@ done_criteria: |
 criteria_by: creator
 verify: [cargo-test, fmt-check]
 schema: 4
-version: 1
+version: 2
 ---
 
 Implements ADR-d8a328e311b9, accepted and never coded. Today `VerifierFile`
