@@ -32,9 +32,14 @@ locally before opening a pull request -- the same commands in both places:
 
 ```
 cargo fmt --check
-cargo test --workspace
+cargo nextest run --workspace
 cargo run -q --bin ank -- check
 ```
+
+The suite runs under [cargo-nextest](https://nexte.st), which `ci.yml` and the
+`cargo-test` verifier both use, so install it once with `cargo install
+cargo-nextest --locked`. Without it, `ank done` stops at exit 9 and names that
+command rather than reporting a failing test.
 
 The third is the same line as the `check-repo` verifier in `.ank/config.yml`, on
 purpose: a CI that validated `.ank/` differently from `ank done` would let a

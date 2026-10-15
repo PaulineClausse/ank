@@ -463,26 +463,32 @@ fn run_verifiers(
     let head = git::run(&repo.worktree, &["rev-parse", "HEAD"]).unwrap_or_default();
     let tree = scope_hash(&repo.worktree, scope);
     let criteria_hash = freeze_hash_short(criteria);
-    let mut proofs = Vec::new();
 
-    for name in declared {
-        let Some(def) = cfg.verifier(name) else {
-            // Not the agent's code failing: the corpus references a verifier
-            // the configuration does not declare.
-            return Err(CliError::new(
-                ExitCode::Environment,
-                format!("{id} declares verifier '{name}', absent from config.yml"),
-            )
-            .with_hint(format!("ank config verifiers.{name}.run \"<command>\"")));
-        };
-        let outcome = verify::run(&repo.worktree, name, def)?;
+    // Side by side, at most `verifier_jobs` at once (TASK-26eab418555a), and
+    // answering exactly what a run one after another would have answered: the
+    // first failure *in declared order* is the one reported, whatever failed
+    // first in time, and nothing is recorded. A verifier declared after a
+    // failure can no longer change that answer, so it is not started, and
+    // killed if it already was; one declared before it still can, so it is
+    // waited for.
+    let outcomes = run_concurrently(repo, cfg, declared, id, cfg.verifier_jobs());
+
+    let mut proofs = Vec::new();
+    for (name, outcome) in declared.iter().zip(outcomes) {
+        // `None` only ever follows a failure, which returned below first.
+        let Some(outcome) = outcome? else { break };
+        let def = cfg
+            .verifier(name)
+            .expect("an undeclared verifier never ran");
         // Progress, and therefore standard error: it is not part of the answer,
         // and §4 requires `--json` to leave stdout byte-for-byte what a
         // caller's parser reads. This line used to precede the JSON document on
         // stdout, so `ank done --json | <parser>` failed on its first line
         // (TASK-2eefcdd80124). Unconditional rather than gated on `--json`,
         // because a gate at each printing site is one more chance to forget
-        // one, and progress belongs on stderr for a human too.
+        // one, and progress belongs on stderr for a human too. Printed here, in
+        // declared order and once all have finished, rather than as each
+        // finishes: the lines read as the sequential run's did.
         let err = style.on_stderr();
         eprintln!(
             "running: {name} ... {} ({:.1}s)",
@@ -513,6 +519,64 @@ fn run_verifiers(
         });
     }
     Ok(proofs)
+}
+
+/// Runs `declared` on at most `jobs` threads and hands back one result per
+/// verifier, in declared order. `Ok(None)` is a verifier that was not started,
+/// or was killed, because one declared before it had already failed.
+fn run_concurrently(
+    repo: &Repo,
+    cfg: &Config,
+    declared: &[String],
+    id: &EntityId,
+    jobs: usize,
+) -> Vec<Result<Option<verify::Outcome>>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    // The lowest index known to have failed; nothing above it matters.
+    let failed_at = AtomicUsize::new(usize::MAX);
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<Result<Option<verify::Outcome>>>>> =
+        declared.iter().map(|_| Mutex::new(None)).collect();
+
+    let work = || loop {
+        let i = next.fetch_add(1, Ordering::SeqCst);
+        let Some(name) = declared.get(i) else { break };
+        let result = if failed_at.load(Ordering::SeqCst) < i {
+            Ok(None)
+        } else if let Some(def) = cfg.verifier(name) {
+            let stop = || failed_at.load(Ordering::SeqCst) < i;
+            verify::run_until(&repo.worktree, name, def, &stop)
+        } else {
+            // Not the agent's code failing: the corpus references a verifier
+            // the configuration does not declare.
+            Err(CliError::new(
+                ExitCode::Environment,
+                format!("{id} declares verifier '{name}', absent from config.yml"),
+            )
+            .with_hint(format!("ank config verifiers.{name}.run \"<command>\"")))
+        };
+        if !matches!(result, Ok(Some(ref o)) if o.ok) && !matches!(result, Ok(None)) {
+            failed_at.fetch_min(i, Ordering::SeqCst);
+        }
+        *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+    };
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.clamp(1, declared.len().max(1)) {
+            scope.spawn(work);
+        }
+    });
+
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or(Ok(None))
+        })
+        .collect()
 }
 
 /// How a caller of [`submitted_proof`] names itself in the hints that parser

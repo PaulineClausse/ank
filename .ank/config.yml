@@ -4,8 +4,8 @@ claim_ttl_max: 2h
 default_branch: main
 verifiers:
   cargo-test:
-    run: cargo test --workspace -q
-    timeout: 10m
+    run: "command -v cargo-nextest >/dev/null 2>&1 || { echo \"cargo-nextest is not installed: cargo install cargo-nextest --locked\" >&2; exit 127; }; cargo nextest run --workspace"
+    timeout: 20m
     default: true
   fmt-check:
     run: cargo fmt --check

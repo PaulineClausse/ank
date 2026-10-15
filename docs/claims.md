@@ -147,12 +147,14 @@ the holder named, and the push settles a race the read misses. `ank init` adds
 the refspec that makes `refs/ank/*` travel, since hosts do not fetch
 non-standard refs on their own.
 
-**An `origin` added after `init` has no refspec until `init` runs again.** In a
-repository with no `origin`, `init` adds nothing and says so: `refspec
+**An `origin` without the refspec is repaired by the first verb that asks.**
+In a repository with no `origin`, `init` adds nothing and says so: `refspec
 +refs/ank/*:refs/ank/* not added: no remote named origin yet, run this once it
 exists (ank init)`, and it says the same on every re-run until there is one.
-Once `origin` exists without the refspec, `status` warns and `check` reports a
-signal, at exit 0, both naming `ank init`:
+Once `origin` exists without the refspec, which is also the state of every
+fresh clone since `git clone` does not carry `remote.origin.fetch`, the first
+`status` or `check` adds it, fetches `refs/ank/*` once, and says both on
+standard error (ADR-1b030fe70442):
 
 <!-- replay travel ANK_AGENT=human:marie part
 $ echo '# auth service' > README.md && git add -A && git commit -q -m "the service"
@@ -161,15 +163,21 @@ $ git init -q --bare ../origin.git && git remote add origin ../origin.git
 -->
 
     $ ank status
-    warning: remote.origin.fetch lacks +refs/ank/*:refs/ank/*, so claims and completion refs are never fetched (ank init)
+    refspec added: +refs/ank/*:refs/ank/*, and refs/ank/* fetched from origin
 
 <!-- replay travel part -->
 
     $ ank check
-    signal: origin: remote.origin.fetch lacks +refs/ank/*:refs/ank/*, so claims and completion refs are never fetched (ank init)
+    signal: allowed_signers: no ratification key declared: permissions are advisory, not enforced (§8)
 
-A second `ank init` adds the refspec, prints `refspec added:
-+refs/ank/*:refs/ank/*`, and both go quiet.
+A clone that already has the refspec pays nothing for it, and with no `origin`
+nothing is written, so `git remote add origin` keeps working. An `origin` that
+cannot be reached still gets the refspec, and the next `git fetch` brings the
+refs. Where the refspec itself could not be written, `status` warns and `check`
+reports a signal, both naming `ank init`, which writes it the same way. A
+re-run of `init` leaves `AGENTS.md` as it finds it: the pointer is written by
+the run that creates `.ank/` and by no later one, so a repository that dropped
+it on purpose keeps it dropped through every repair (ADR-1f5a45d43f82).
 
 Without a remote, `git worktree`s of a single clone are still arbitrated,
 because they share `refs/ank/`. **Two clones with no common origin are not

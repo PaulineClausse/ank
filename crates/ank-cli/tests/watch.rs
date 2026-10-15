@@ -30,8 +30,8 @@
 //! being trusted -- the moment a warm listing and a cold one differ, the daemon
 //! has become a source of truth nobody voted for.
 
-mod index_file;
-mod scratch;
+use crate::index_file;
+use crate::scratch;
 use ank_contract::events;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -1002,9 +1002,12 @@ fn the_only_thing_it_writes_into_a_repository_is_the_index() {
 /// clone cannot show that, because there is no second plane for the first to be
 /// stale about, and a test that tried would be measuring nothing.
 ///
-/// The second clone is made by `git clone` and never by `ank init`, so it
-/// carries no `+refs/ank/*:refs/ank/*` refspec: without the watcher there is no
-/// route by which a claim taken elsewhere reaches it at all.
+/// The second clone is made by `git clone` and then given the
+/// `+refs/ank/*:refs/ank/*` refspec its first `status` would add on its own
+/// (ADR-1b030fe70442): that repair fetches once, at the transition, and the
+/// state this test is about is the one after it, where nobody fetches again.
+/// Without the watcher there is then no route by which a claim taken elsewhere
+/// reaches it at all.
 #[test]
 fn a_claim_taken_in_one_clone_is_reported_by_status_in_the_other() {
     let home = Home::new();
@@ -1021,6 +1024,15 @@ fn a_claim_taken_in_one_clone_is_reported_by_status_in_the_other() {
     );
     first.git(&home, &["push", "-q", "-u", "origin", "main"]);
     let second = clone(&home, &origin, &root.join("second"));
+    second.git(
+        &home,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/ank/*:refs/ank/*",
+        ],
+    );
     assert_eq!(first.identity(&home), second.identity(&home));
     let task = first.task_id(&home);
 
@@ -1235,6 +1247,93 @@ fn a_watching_cycle_moves_the_tracking_namespace_and_nothing_else() {
         mine.ank_refs(&home, "refs/remotes"),
         remotes,
         "a remote-tracking branch moved, so the fetch reached beyond refs/ank/*"
+    );
+}
+
+/// The same negative, in a clone that carries `+refs/ank/*:refs/ank/*`
+/// (TASK-625d3bf0c9a1).
+///
+/// The configured refspec is the case the test above cannot see. Given a
+/// refspec of its own, `git fetch` still runs its opportunistic update of
+/// every configured remote-tracking ref the fetched refs match, and init's
+/// refspec maps `refs/ank/claims/*` onto itself: the mirror would then land on
+/// the plane it exists to stay off, and rewrite a live lease from the remote.
+/// Every clone carries that refspec once its first `status` has run
+/// (ADR-1b030fe70442), so this is the ordinary clone and not a corner.
+#[test]
+fn a_watching_cycle_leaves_the_claims_alone_where_the_refs_ank_refspec_is_configured() {
+    let home = Home::new();
+    let root = scratch("refmap");
+    let origin = root.join("origin.git");
+    bare(&home, &origin);
+
+    let seed = Corpus::new(root.join("seed"), &home);
+    seed.git(
+        &home,
+        &["config", "remote.origin.url", &origin.display().to_string()],
+    );
+    seed.git(&home, &["push", "-q", "-u", "origin", "main"]);
+
+    let mine = clone(&home, &origin, &root.join("mine"));
+    mine.git(
+        &home,
+        &[
+            "config",
+            "--add",
+            "remote.origin.fetch",
+            "+refs/ank/*:refs/ank/*",
+        ],
+    );
+    let task = mine.task_id(&home);
+    mine.ank_as(
+        &home,
+        "mine@ank.local",
+        &["claim", &task, "--criteria", "the mirror never touches it"],
+    );
+
+    // Origin moves under this clone: its claim rewritten, and a claim on a
+    // task it has never held. Both are refs the opportunistic update would
+    // bring onto refs/ank/claims/* here.
+    let record = root.join("forged.yml");
+    std::fs::write(&record, "state: claim\nholder: someone-else@host\n").unwrap();
+    let blob = seed.git(&home, &["hash-object", "-w", &record.display().to_string()]);
+    let blob = String::from_utf8_lossy(&blob.stdout).trim().to_string();
+    let other = "TASK-0000000000ff";
+    seed.git(
+        &home,
+        &[
+            "push",
+            "-q",
+            "origin",
+            &format!("+{blob}:refs/ank/claims/{task}"),
+            &format!("+{blob}:refs/ank/claims/{other}"),
+        ],
+    );
+
+    home.declare(&format!(
+        "schema: 1\nfetch: 1\nwatch:\n  {}: {}\n",
+        mine.identity(&home),
+        mine.root.display()
+    ));
+    let claims = mine.ank_refs(&home, "refs/ank/claims");
+    assert!(
+        claims.contains(&format!("refs/ank/claims/{task}")),
+        "the fixture holds a claim of its own: {claims}"
+    );
+
+    let out = home.daemon(&["--once"]).output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    assert!(
+        mine.ank_refs(&home, "refs/ank/watch")
+            .contains(&format!("refs/ank/watch/origin/claims/{other}")),
+        "the mirror is what the cycle was for: {}",
+        mine.ank_refs(&home, "refs/ank")
+    );
+    assert_eq!(
+        mine.ank_refs(&home, "refs/ank/claims"),
+        claims,
+        "the mirror landed on refs/ank/claims through the configured refspec"
     );
 }
 

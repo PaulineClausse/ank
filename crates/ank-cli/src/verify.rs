@@ -75,7 +75,45 @@ pub fn definition_hash(v: &Verifier) -> String {
     h.update(v.run.trim().as_bytes());
     h.update([0]);
     h.update(v.timeout.as_secs().to_string().as_bytes());
+    // `inputs` and `env` are appended only when declared (ADR-d8a328e311b9),
+    // so a verifier declaring neither keeps the hash every proof recorded
+    // before they existed. Each string goes in length-prefixed: two fields
+    // can never trade bytes and produce one hash.
+    if let Some(inputs) = &v.inputs {
+        // A set, not a sequence: the order globs are listed in changes
+        // nothing about which files can change the result.
+        let globs: std::collections::BTreeSet<&str> = inputs.iter().map(String::as_str).collect();
+        h.update(b"\0inputs");
+        for g in globs {
+            put(&mut h, g);
+        }
+    }
+    if let Some(env) = &v.env {
+        h.update(b"\0env");
+        for (field, value) in [
+            ("image", env.image.as_deref()),
+            ("platform", env.platform.as_deref()),
+            // Resolved by the parser: `network: none` written out and left to
+            // its default under an image are one environment.
+            ("network", env.network.map(crate::config::Network::as_str)),
+        ] {
+            if let Some(value) = value {
+                put(&mut h, field);
+                put(&mut h, value);
+            }
+        }
+        for (name, value) in &env.vars {
+            put(&mut h, "var");
+            put(&mut h, name);
+            put(&mut h, value);
+        }
+    }
     hex::encode(h.finalize())[..12].to_string()
+}
+
+fn put(h: &mut Sha256, s: &str) {
+    h.update((s.len() as u64).to_le_bytes());
+    h.update(s.as_bytes());
 }
 
 pub fn definition_ref(name: &str, v: &Verifier) -> String {
@@ -143,6 +181,22 @@ fn on_path(name: &str) -> Option<PathBuf> {
 /// that is waiting for it to exit, and a test suite is exactly the kind of
 /// command that prints a lot.
 pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
+    Ok(run_until(cwd, name, v, &|| false)?.expect("a run nothing stops is never cancelled"))
+}
+
+/// [`run`], polling `stop` while the verifier runs: once it answers true the
+/// verifier is killed and `None` comes back, an outcome nobody will read.
+///
+/// This is what lets `done` run verifiers side by side (TASK-26eab418555a):
+/// once one fails, the ones declared after it can no longer change the
+/// answer, and letting them run on would leave them running after `done`
+/// has already said no.
+pub fn run_until(
+    cwd: &Path,
+    name: &str,
+    v: &Verifier,
+    stop: &dyn Fn() -> bool,
+) -> Result<Option<Outcome>> {
     let sh = find_sh()?;
     let out_path = std::env::temp_dir().join(format!(
         "ank-verify-{}-{}.out",
@@ -163,7 +217,13 @@ pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
     })?;
 
     let started = Instant::now();
-    let mut child = Command::new(&sh)
+    let mut command = Command::new(&sh);
+    // A group of its own, so that killing the verifier kills what it started:
+    // `sh -c "a; b"` keeps the shell as a parent, and a kill aimed at the
+    // shell alone leaves `b` running with nobody waiting for it.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command
         .current_dir(cwd)
         .arg("-c")
         .arg(&v.run)
@@ -184,9 +244,13 @@ pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
+                if stop() {
+                    kill_tree(&mut child);
+                    let _ = std::fs::remove_file(&out_path);
+                    return Ok(None);
+                }
                 if started.elapsed() >= v.timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     timed_out = true;
                     break std::process::ExitStatus::default();
                 }
@@ -223,14 +287,42 @@ pub fn run(cwd: &Path, name: &str, v: &Verifier) -> Result<Outcome> {
 
     let mut h = Sha256::new();
     h.update(&output);
-    Ok(Outcome {
+    Ok(Some(Outcome {
         name: name.to_string(),
         ok: !timed_out && status.success(),
         code,
         elapsed,
         output_hash: hex::encode(h.finalize()),
         timed_out,
-    })
+    }))
+}
+
+/// Kills a verifier and everything it started, then reaps it.
+///
+/// On Unix the verifier leads a process group of its own and the group is
+/// killed whole. On Windows `taskkill /T` walks the tree from the shell down.
+/// Both through a process rather than a binding: no crate enters for one
+/// signal, and the shell's own kill is the fallback when neither runs.
+fn kill_tree(child: &mut std::process::Child) {
+    let pid = child.id().to_string();
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", &pid])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// The code 5 a failed verifier deserves, with the elapsed time when it ran out
@@ -263,6 +355,8 @@ mod tests {
         Verifier {
             run: run.to_string(),
             timeout: Duration::from_secs(secs),
+            inputs: None,
+            env: None,
         }
     }
 
@@ -382,6 +476,61 @@ mod tests {
         assert_eq!(
             definition_ref("cargo-test", &a),
             format!("cargo-test@{}", definition_hash(&a))
+        );
+    }
+
+    /// ADR-d8a328e311b9: `inputs` and `env` are part of what ran, and a
+    /// verifier declaring neither hashes exactly as it did before they existed.
+    #[test]
+    fn the_definition_hash_covers_inputs_and_env_and_nothing_when_neither_is_declared() {
+        let p = std::path::Path::new("config.yml");
+        let hash = |yaml: &str| {
+            let cfg = crate::config::parse(&format!("schema: 1\nverifiers:\n  t:\n{yaml}"), p)
+                .unwrap_or_else(|e| panic!("{yaml}: {}", e.message));
+            definition_hash(&cfg.verifiers["t"])
+        };
+        let bare = hash("    run: cargo test\n");
+        // sha256("cargo test\0600"), first twelve hex digits: the formula
+        // every proof recorded so far was hashed with.
+        assert_eq!(bare, "ea889101030e");
+        assert_eq!(
+            hash("    run: cargo test\n    env: {}\n"),
+            bare,
+            "an env declaring nothing is no environment"
+        );
+
+        let inputs = hash("    run: cargo test\n    inputs: [\"src/**\", \"Cargo.toml\"]\n");
+        assert_ne!(inputs, bare);
+        assert_eq!(
+            hash("    run: cargo test\n    inputs:\n      - Cargo.toml\n      - src/**\n"),
+            inputs,
+            "a set of globs, whatever order and style lists them"
+        );
+        assert_ne!(
+            hash("    run: cargo test\n    inputs: [\"src/**\"]\n"),
+            inputs
+        );
+
+        let image = "    run: cargo test\n    env:\n      image: r@sha256:\
+                     0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n      \
+                     platform: linux/amd64\n";
+        let pinned = hash(image);
+        assert_ne!(pinned, bare);
+        assert_eq!(
+            hash(&format!("{image}      network: none\n")),
+            pinned,
+            "network none written out is the default under an image"
+        );
+        assert_ne!(hash(&format!("{image}      network: open\n")), pinned);
+        let with_var = hash(&format!("{image}      vars:\n        LANG: C\n"));
+        assert_ne!(with_var, pinned);
+        assert_ne!(
+            hash(&format!("{image}      vars:\n        LANG: POSIX\n")),
+            with_var
+        );
+        assert_ne!(
+            hash("    run: cargo test\n    env:\n      platform: linux/arm64\n"),
+            hash("    run: cargo test\n    env:\n      platform: linux/amd64\n")
         );
     }
 

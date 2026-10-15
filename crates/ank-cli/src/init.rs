@@ -268,6 +268,9 @@ fn io(path: &Path, e: std::io::Error) -> CliError {
 pub fn init_at(root: &Path) -> Result<Report> {
     let mut report = Report::default();
     let ank = root.join(repo::ANK_DIR);
+    // Read before anything below creates it: the `AGENTS.md` pointer belongs
+    // to the run that makes the corpus, and only to that one.
+    let creates_corpus = !ank.exists();
 
     // **One directory, and it is the only one this verb makes** (§6). Every
     // entity of every kind lives in `.ank/entities/`, an entry included since
@@ -312,8 +315,15 @@ pub fn init_at(root: &Path) -> Result<Report> {
     let gi = root.join(".gitignore");
     report.wrote_gitignore = ensure_gitignore(&gi)?;
 
-    let agents = root.join("AGENTS.md");
-    report.wrote_agents_pointer = ensure_line(&agents, AGENTS_POINTER)?;
+    // A bootstrap aid and not an invariant (ADR-1f5a45d43f82). `init` is also
+    // the repair verb `status` and `check` name for a missing refspec, and a
+    // repair that re-appended the pointer undid every team that dropped it on
+    // purpose: observed 2026-10-11 in this repository. On an existing corpus
+    // `AGENTS.md` is left as found, created or not.
+    if creates_corpus {
+        let agents = root.join("AGENTS.md");
+        report.wrote_agents_pointer = ensure_line(&agents, AGENTS_POINTER)?;
+    }
 
     match ensure_refspec(root)? {
         OriginFetch::Lacks => report.added_refspec = true,
@@ -464,6 +474,44 @@ fn ensure_refspec(root: &Path) -> Result<OriginFetch> {
         git::run(root, &["config", "--add", "remote.origin.fetch", REFSPEC])?;
     }
     Ok(found)
+}
+
+/// What `origin` fetches, repaired when it lacks [`REFSPEC`] (ADR-1b030fe70442),
+/// with the line that says so.
+///
+/// Every clone starts without the refspec, because `git clone` does not carry
+/// `remote.origin.fetch`, and until it was added by hand `check` asserted an
+/// absence it could not observe: 214 `done with no test proof` signals in a
+/// fresh clone of this repository at fb17a26a, every one of them attested on
+/// origin. So a verb that already asks this question repairs the answer it
+/// gets: the refspec is added through the writer `init` uses, and `refs/ank/*`
+/// is fetched once, at the transition. A clone that has the refspec pays
+/// nothing beyond the question it was already asking; with no origin nothing
+/// is written, for the reason [`ensure_refspec`] gives.
+///
+/// **A failed fetch is not an error.** The refspec stays written and the next
+/// `git fetch` brings the refs; the verb answers on what this clone holds, as
+/// it does with the refspec present and origin unreachable. A refspec that
+/// could not be written is left as `Lacks`, so `status` and `check` keep
+/// saying so.
+pub fn repair_origin(root: &Path) -> (OriginFetch, Option<String>) {
+    let found = origin_fetch(root);
+    if found != OriginFetch::Lacks {
+        return (found, None);
+    }
+    if ensure_refspec(root).is_err() {
+        return (OriginFetch::Lacks, None);
+    }
+    let fetched = git::fetch_ref(root, "refs/ank/*").unwrap_or(false);
+    let line = if fetched {
+        format!("refspec added: {REFSPEC}, and refs/ank/* fetched from origin")
+    } else {
+        format!(
+            "refspec added: {REFSPEC}; refs/ank/* could not be fetched from \
+             origin, the next git fetch brings them"
+        )
+    };
+    (OriginFetch::Fetches, Some(line))
 }
 
 /// What `origin` fetches, as far as `refs/ank/*` is concerned.

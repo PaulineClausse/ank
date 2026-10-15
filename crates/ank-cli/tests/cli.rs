@@ -16,9 +16,9 @@
 //! and `ank-cli` has no library target — so there is no unit test that could
 //! spawn the binary even if we wanted one.
 
-mod fixture;
-mod index_file;
-mod scratch;
+use crate::fixture;
+use crate::index_file;
+use crate::scratch;
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -923,6 +923,18 @@ impl Repo {
         ] {
             let out = git_command(&other).args(args).output().unwrap();
             assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        }
+        // Both carry the `refs/ank/*` refspec, as `init` writes it once origin
+        // exists. Without it the first `status` or `check` in either adds it
+        // and fetches the namespace (ADR-1b030fe70442), and every test built
+        // on this fixture is about a clone that has *not* fetched since: the
+        // steady state, where a ref origin moves stays unseen here.
+        for at in [&self.0, &other] {
+            let out = git_command(at)
+                .args(["config", "--add", "remote.origin.fetch", init_refspec()])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{}", stderr(&out));
         }
         (origin, other)
     }
@@ -5543,6 +5555,103 @@ fn init_creates_one_directory_and_reports_exactly_the_one_it_creates() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn init_in(dir: &Path) -> Output {
+    ank_command()
+        .args(["init"])
+        .env("ANK_AGENT", "claude-code@ank")
+        .current_dir(dir)
+        .output()
+        .expect("the binary must have been built")
+}
+
+const AGENTS_POINTER_LINE: &str = "This repo uses Ank: tasks and decisions live in `.ank/`.";
+
+/// The run that creates `.ank/` places the `AGENTS.md` pointer and says so,
+/// whether the file was absent or held something else (ADR-1f5a45d43f82).
+#[test]
+fn the_run_that_creates_the_corpus_places_the_agents_pointer() {
+    let absent = fresh_git_dir("init-agents-absent");
+    let out = init_in(&absent);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("pointer added to AGENTS.md"),
+        "{}",
+        stdout(&out)
+    );
+    let agents = std::fs::read_to_string(absent.join("AGENTS.md")).unwrap();
+    assert!(agents.contains(AGENTS_POINTER_LINE), "{agents}");
+
+    let lacking = fresh_git_dir("init-agents-lacking");
+    std::fs::write(lacking.join("AGENTS.md"), "Existing guidance.\n").unwrap();
+    let out = init_in(&lacking);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("pointer added to AGENTS.md"),
+        "{}",
+        stdout(&out)
+    );
+    let agents = std::fs::read_to_string(lacking.join("AGENTS.md")).unwrap();
+    assert!(agents.starts_with("Existing guidance.\n"), "{agents}");
+    assert!(agents.contains(AGENTS_POINTER_LINE), "{agents}");
+
+    let _ = std::fs::remove_dir_all(&absent);
+    let _ = std::fs::remove_dir_all(&lacking);
+}
+
+/// A re-run of `init` on a corpus that already exists leaves `AGENTS.md`
+/// byte for byte as it finds it, and still repairs the refspec
+/// (ADR-1f5a45d43f82, TASK-89ea64037e2d). Observed 2026-10-11 in this
+/// repository: `ank init`, run to add the refspec, re-appended the pointer to
+/// an `AGENTS.md` that had dropped it on purpose.
+#[test]
+fn a_re_run_of_init_leaves_agents_md_as_it_finds_it() {
+    let cases: [(&str, Option<&str>); 3] = [
+        (
+            "holds",
+            Some("Guidance.\n\nThis repo uses Ank: tasks and decisions live in `.ank/`.\n"),
+        ),
+        ("lacks", Some("Guidance, the pointer dropped on purpose.\n")),
+        ("absent", None),
+    ];
+    for (what, content) in cases {
+        let dir = fresh_git_dir(&format!("init-rerun-{what}"));
+        let out = init_in(&dir);
+        assert_eq!(code(&out), 0, "{what}: {}", stderr(&out));
+        let agents = dir.join("AGENTS.md");
+        match content {
+            Some(c) => std::fs::write(&agents, c).unwrap(),
+            None => std::fs::remove_file(&agents).unwrap(),
+        }
+        // The refspec is written only once origin has a URL, so this re-run
+        // has one to add, and the repair half of the clause is exercised.
+        let out = git_command(&dir)
+            .args(["config", "remote.origin.url", "https://example.invalid/r"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", stderr(&out));
+
+        let out = init_in(&dir);
+        assert_eq!(code(&out), 0, "{what}: {}", stderr(&out));
+        let said = stdout(&out);
+        // Byte for byte: the bytes as read, decoded strictly so a failure
+        // prints text, and compared with the literal written above.
+        let after = std::fs::read(&agents)
+            .ok()
+            .map(|b| String::from_utf8(b).expect("AGENTS.md is not UTF-8"));
+        assert_eq!(
+            after.as_deref(),
+            content,
+            "{what}: a re-run changed AGENTS.md:\n{said}"
+        );
+        assert!(!said.contains("AGENTS.md"), "{what}: {said}");
+        assert!(
+            said.contains(&format!("refspec added: {}", init_refspec())),
+            "{what}: the re-run did not repair the refspec:\n{said}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// `init` refuses `--repo` by name, and writes nowhere while doing it.
 ///
 /// The shape of the fixture is the defect: the process runs **inside** one
@@ -6271,7 +6380,19 @@ fn status_names_the_refs_this_checkout_holds_that_origin_has_moved_past() {
         here, head,
         "the fixture moved origin to where it already was"
     );
-    r.git(&["push", "-q", "origin", &format!("+{head}:{refname}")]);
+    // From the other clone: with the `refs/ank/*` refspec configured, git
+    // updates the local ref a push names to what it pushed, so a push made
+    // here would move this checkout along with origin and leave nothing stale.
+    let out = git_command(&other)
+        .args(["push", "-q", "origin", &format!("+{head}:{refname}")])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "push: {}", stderr(&out));
+    assert_eq!(
+        r.git(&["rev-parse", &refname]),
+        here,
+        "the fixture moved this checkout's ref along with origin's"
+    );
 
     // A ref origin holds that this checkout has never seen, which is the other
     // half of the count.
@@ -6455,6 +6576,10 @@ fn a_claim_a_watcher_mirrored_is_reported_by_status_and_by_nothing_else() {
         "--prune",
         "--no-tags",
         "--no-write-fetch-head",
+        // As the watcher passes it (TASK-625d3bf0c9a1): this clone carries
+        // init's refspec, and without an empty refmap git would also update
+        // the refs/ank/claims/* it maps the fetched refs onto.
+        "--refmap=",
         "origin",
         "+refs/ank/*:refs/ank/watch/origin/*",
     ]);
@@ -6517,6 +6642,10 @@ fn a_claim_a_watcher_mirrored_is_reported_by_status_and_by_nothing_else() {
         "--prune",
         "--no-tags",
         "--no-write-fetch-head",
+        // As the watcher passes it (TASK-625d3bf0c9a1): this clone carries
+        // init's refspec, and without an empty refmap git would also update
+        // the refs/ank/claims/* it maps the fetched refs onto.
+        "--refmap=",
         "origin",
         "+refs/ank/*:refs/ank/watch/origin/*",
     ]);
@@ -13843,7 +13972,10 @@ const GLOB_FLAGS: [(&str, &str); 3] = [
 /// path if it is called `--scope`" — is exactly what would let the next
 /// `--under <glob>` through in silence, which is the failure this whole task is
 /// a correction of.
-const NOT_A_PATH: [&str; 38] = [
+const NOT_A_PATH: [&str; 39] = [
+    // Carries no value at all: `accept --pr` names nothing, it carries the
+    // ratifications to a pull request (ADR-2a63c0c87691).
+    "--pr",
     // Carries no value at all: the directory it writes is made under the
     // temporary directory by the verb, and nothing about it comes off the
     // command line (ADR-e1d750884b82).
@@ -17729,19 +17861,11 @@ fn attestable() -> (Repo, PathBuf) {
     );
     assert_eq!(code(&out), 0, "{}{}", stdout(&out), stderr(&out));
 
+    // `cloned` installs what `ank init` installs on both sides, and that is
+    // the reason ADR-493471d64ba0 says an existing repository needs no
+    // configuration change: one refspec already carries every namespace under
+    // refs/ank/, this one included.
     let (_origin, other) = r.cloned();
-    // What `ank init` installs, and the reason ADR-493471d64ba0 says an
-    // existing repository needs no configuration change: one refspec already
-    // carries every namespace under refs/ank/, this one included. Both sides
-    // get it, because `cloned` wires the remote on the original too and the
-    // reading clone is the one that needs the fetch to bring anything.
-    for at in [&r.0, &other] {
-        let out = git_command(at)
-            .args(["config", "--add", "remote.origin.fetch", init_refspec()])
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "{}", stderr(&out));
-    }
     (r, other)
 }
 
@@ -26597,5 +26721,264 @@ fn status_json_says_when_each_claim_was_taken() {
             line(id, "claimed") <= line(id, "expires"),
             "a claim taken after it expires"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verifiers run concurrently, bounded by verifier_jobs (TASK-26eab418555a)
+// ---------------------------------------------------------------------------
+
+/// Two verifiers that can only both pass if they run at the same time: each
+/// leaves a marker and then waits for the other's. Concurrency is shown by
+/// what happens and never by a stopwatch (CLAUDE.md): run one at a time, the
+/// first waits for a marker nobody will write until it has finished, and its
+/// timeout is what `done` reports.
+const RENDEZVOUS: &str = "verifiers:\n  \
+     left:\n    run: \"touch left.mark; while [ ! -e right.mark ]; do sleep 0.05; done\"\n    timeout: 10s\n  \
+     right:\n    run: \"touch right.mark; while [ ! -e left.mark ]; do sleep 0.05; done\"\n    timeout: 10s\n";
+
+const JOBS_ID: &str = "TASK-00000000a0b1";
+
+fn jobs_fixture(jobs: Option<u32>, verifiers: &str, verify: &[&str]) -> Repo {
+    let jobs = jobs
+        .map(|n| format!("verifier_jobs: {n}\n"))
+        .unwrap_or_default();
+    let r = Repo::new().with_verifiers(&format!("{jobs}{verifiers}"));
+    r.seed_task_with(JOBS_ID, Some("A criterion."), verify);
+    let out = r.ank("claude-code@ank", &["claim", JOBS_ID]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    r
+}
+
+/// The `proof:` block of a task file, with the HEAD it names replaced, so that
+/// two repositories built alike compare equal on everything else.
+fn proof_block(r: &Repo) -> String {
+    let head: String = r.head().chars().take(7).collect();
+    let text = r.task_text(JOBS_ID);
+    let start = text
+        .find("proof:")
+        .unwrap_or_else(|| panic!("no proof: {text}"));
+    let block: String = text[start..]
+        .lines()
+        .take_while(|l| *l == "proof:" || l.starts_with(' '))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    block.replace(&head, "<head>")
+}
+
+/// What `done` said, less the progress lines, which carry a wall clock.
+fn refusal(out: &Output) -> String {
+    stderr(out)
+        .lines()
+        .filter(|l| !l.starts_with("running:"))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// A refusal with the duration of a timeout masked. The message prints the
+/// elapsed time as measured, which no two runs share to the tenth of a second
+/// under load, so it is the one part of the message the sequential run cannot
+/// be expected to reproduce.
+fn elapsed_masked(refusal: &str) -> String {
+    const AT: &str = "timed out after ";
+    let mut masked = String::new();
+    let mut rest = refusal;
+    while let Some(i) = rest.find(AT) {
+        let (head, tail) = rest.split_at(i + AT.len());
+        masked.push_str(head);
+        let digits = tail
+            .find(|c: char| !c.is_ascii_digit() && c != '.')
+            .unwrap_or(tail.len());
+        masked.push_str("<elapsed>");
+        rest = &tail[digits..];
+    }
+    masked.push_str(rest);
+    masked
+}
+
+/// A verifier that, once started, appends to `beat` ten times a second from a
+/// background process for half a minute. A `beat` that stops growing after
+/// `done` returned is a `done` that left nothing of it running, grandchild
+/// included, measured on all three platforms without reading a pid.
+const HEARTBEAT: &str =
+    "\"(i=0; while [ $i -lt 300 ]; do echo x >> beat; sleep 0.1; i=$((i+1)); done) & wait\"";
+
+fn assert_nothing_beats(r: &Repo) {
+    let size = || {
+        std::fs::metadata(r.0.join("beat"))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    };
+    std::thread::sleep(std::time::Duration::from_millis(600));
+    let before = size();
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+    assert_eq!(
+        size(),
+        before,
+        "a verifier process is still running after done returned"
+    );
+}
+
+#[test]
+fn two_verifiers_waiting_on_each_other_pass_with_two_jobs() {
+    let r = jobs_fixture(Some(2), RENDEZVOUS, &["left", "right"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    assert!(r.task_text(JOBS_ID).contains("status: done"));
+    let err = stderr(&out);
+    assert_eq!(err.matches("running: left ... ok").count(), 1, "{err}");
+    assert_eq!(err.matches("running: right ... ok").count(), 1, "{err}");
+}
+
+#[test]
+fn one_job_runs_them_one_at_a_time_and_the_first_times_out() {
+    let r = jobs_fixture(Some(1), RENDEZVOUS, &["left", "right"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("verifier 'left' timed out"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!r.task_text(JOBS_ID).contains("proof:"));
+}
+
+#[test]
+fn verifier_jobs_unset_runs_as_many_as_the_machine_has_cores() {
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if cores < 2 {
+        eprintln!("skipped: {cores} core available, the clause asks for two");
+        return;
+    }
+    let r = jobs_fixture(None, RENDEZVOUS, &["left", "right"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+}
+
+#[test]
+fn proof_entries_are_written_in_declared_order_as_a_sequential_run_writes_them() {
+    // The first declared finishes last: completion order and declared order
+    // disagree, which is the case the order has to survive.
+    let verifiers =
+        "verifiers:\n  slow:\n    run: \"sleep 1; echo slow\"\n  fast:\n    run: echo fast\n";
+    let sequential = jobs_fixture(Some(1), verifiers, &["slow", "fast"]);
+    let concurrent = jobs_fixture(Some(2), verifiers, &["slow", "fast"]);
+    for r in [&sequential, &concurrent] {
+        let out = r.ank("claude-code@ank", &["done"]);
+        assert_eq!(code(&out), 0, "{}", stderr(&out));
+    }
+    let block = proof_block(&concurrent);
+    let slow = block.find("verifier: slow@").expect(&block);
+    let fast = block.find("verifier: fast@").expect(&block);
+    assert!(slow < fast, "declared order lost:\n{block}");
+    assert_eq!(block, proof_block(&sequential));
+}
+
+#[test]
+fn a_failing_verifier_answers_as_it_would_sequentially_and_leaves_nothing_running() {
+    let cases: [(&str, &str, i32, &str); 3] = [
+        (
+            "\"sleep 0.3; exit 3\"",
+            "",
+            5,
+            "verifier 'first' failed (exit 3)",
+        ),
+        (
+            "\"sleep 30\"",
+            "    timeout: 1s\n",
+            5,
+            "verifier 'first' timed out",
+        ),
+        (
+            "no-such-command-anywhere-ank",
+            "",
+            9,
+            "verifier 'first' could not run",
+        ),
+    ];
+    for (run, extra, expected, said) in cases {
+        let verifiers = format!(
+            "verifiers:\n  first:\n    run: {run}\n{extra}  second:\n    run: {HEARTBEAT}\n"
+        );
+        let concurrent = jobs_fixture(Some(2), &verifiers, &["first", "second"]);
+        let out = concurrent.ank("claude-code@ank", &["done"]);
+        assert_eq!(code(&out), expected, "{run}: {}", stderr(&out));
+        assert!(stderr(&out).contains(said), "{run}: {}", stderr(&out));
+        let text = concurrent.task_text(JOBS_ID);
+        assert!(
+            !text.contains("proof:"),
+            "{run}: a proof was recorded: {text}"
+        );
+        assert!(!text.contains("status: done"), "{run}: {text}");
+        assert_nothing_beats(&concurrent);
+
+        let sequential = jobs_fixture(Some(1), &verifiers, &["first", "second"]);
+        let seq = sequential.ank("claude-code@ank", &["done"]);
+        assert_eq!(code(&seq), expected, "{run}: {}", stderr(&seq));
+        assert_eq!(
+            elapsed_masked(&refusal(&out)),
+            elapsed_masked(&refusal(&seq)),
+            "{run}"
+        );
+    }
+}
+
+#[test]
+fn a_refusal_differing_only_by_the_elapsed_time_compares_equal() {
+    let at = |t: &str| format!("error[5]: verifier 'first' timed out after {t}s\n");
+    assert_eq!(elapsed_masked(&at("1.1")), elapsed_masked(&at("1.2")));
+    assert_eq!(elapsed_masked(&at("1.0")), elapsed_masked(&at("600.0")));
+    assert_ne!(
+        elapsed_masked(&at("1.1")),
+        elapsed_masked("error[5]: verifier 'second' timed out after 1.1s\n")
+    );
+    assert_ne!(
+        elapsed_masked(&at("1.1")),
+        elapsed_masked("error[9]: verifier 'first' timed out after 1.1s\n")
+    );
+    assert_ne!(
+        elapsed_masked("verifier 'first' failed (exit 3)\n"),
+        elapsed_masked("verifier 'first' failed (exit 4)\n")
+    );
+}
+
+#[test]
+fn the_first_failure_in_declared_order_is_the_one_reported() {
+    // The second fails first in time; sequentially the first would have been
+    // reported, and that is the answer.
+    let verifiers =
+        "verifiers:\n  first:\n    run: \"sleep 1; exit 4\"\n  second:\n    run: \"exit 3\"\n";
+    let r = jobs_fixture(Some(2), verifiers, &["first", "second"]);
+    let out = r.ank("claude-code@ank", &["done"]);
+    assert_eq!(code(&out), 5, "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("verifier 'first' failed (exit 4)"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn config_writes_verifier_jobs_and_refuses_zero() {
+    let r = Repo::new();
+    let out = r.ank("claude-code@ank", &["config", "verifier_jobs", "3"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let file = std::fs::read_to_string(r.0.join(".ank/config.yml")).unwrap();
+    assert!(file.contains("verifier_jobs: 3\n"), "{file}");
+
+    for bad in ["0", "-1", "many"] {
+        let out = r.ank("claude-code@ank", &["config", "verifier_jobs", bad]);
+        assert_ne!(code(&out), 0, "{bad} was accepted");
+        // `-1` never reaches the config: the argument parser reads it as a
+        // flag and refuses it there, which is a refusal all the same.
+        if bad != "-1" {
+            assert!(
+                stderr(&out).contains("verifier_jobs"),
+                "{bad}: {}",
+                stderr(&out)
+            );
+        }
+        let after = std::fs::read_to_string(r.0.join(".ank/config.yml")).unwrap();
+        assert_eq!(after, file, "{bad} touched the file");
     }
 }
